@@ -4,13 +4,18 @@ import PIL.Image
 import numpy as np
 import subprocess
 
-number_of_points = 100
+number_of_points = 10
 point_resolution = 32
 vertices = np.empty(
     shape=(point_resolution * number_of_points * 3, 2), dtype=np.float32
 )
 window_width = 1024
 window_height = 1024
+separation = 0.1
+point_radius = separation
+gravitational_constant = 0.01
+substeps = 16
+dt = 0.1 / substeps
 
 
 class FfmpegWriter:
@@ -34,11 +39,11 @@ class FfmpegWriter:
             "-y",
             output,
         ]
-        self.proc = subprocess.Popen(args ,stdin=subprocess.PIPE)
+        self.proc = subprocess.Popen(args, stdin=subprocess.PIPE)
 
     def add_frame(self, image_array):
         self.proc.stdin.write(image_array.tobytes())
-    
+
     def finish(self):
         self.proc.stdin.close()
         self.proc.communicate()
@@ -46,16 +51,53 @@ class FfmpegWriter:
 
 ffmpeg_writer = FfmpegWriter("out.webm")
 
+
 class Simulation:
     def __init__(self):
-        self.positions = np.random.rand(number_of_points, 2) * 2 - 1
-        self.frame_count = 60
+        self.positions = (np.random.rand(number_of_points, 2) * 2 - 1) * (
+            1 - separation
+        )
+        for _ in range(substeps):
+            self.resolve_colisions()
+        velocity = np.stack([self.positions[:, 1], -self.positions[:, 0]], axis=-1)
+        velocity = velocity / np.linalg.norm(velocity, axis=-1, keepdims=True)
+        self.prev_positions = self.positions + velocity * dt * 0.06
+        self.frame_count = 300
 
     def end_frame(self, image_array):
         ffmpeg_writer.add_frame(image_array)
+    
+    def resolve_colisions(self):
+        delta = np.zeros_like(self.positions)
+        for i in range(number_of_points):
+            for j in range(number_of_points):
+                r = self.positions[j] - self.positions[i]
+                r_len = np.linalg.norm(r)
+                if r_len < 2 * separation and r_len > 1e-5:
+                    delta[i] -= r / r_len * (2 * separation - r_len) / 2
+        self.positions += delta
 
+    def recenter_view(self):
+        mean_position = self.positions.mean(0, keepdims=True)
+        self.positions -= mean_position
+        self.prev_positions -= mean_position
+    
     def start_frame(self):
-        self.positions *= 0.99
+        for _ in range(substeps):
+            accel = np.zeros(shape=(number_of_points, 2), dtype=float)
+            for i in range(number_of_points):
+                for j in range(number_of_points):
+                    r = self.positions[j] - self.positions[i]
+                    r_len = np.linalg.norm(r)
+                    if r_len > 2 * separation:
+                        accel[i] += r / r_len**3 * gravitational_constant
+
+            self.resolve_colisions()
+            self.positions, self.prev_positions = (
+                2 * self.positions - self.prev_positions + dt**2 * accel,
+                self.positions,
+            )
+        self.recenter_view()
         if self.frame_count > 0:
             self.frame_count -= 1
             return self.positions
@@ -64,6 +106,7 @@ class Simulation:
 
 
 simulation = Simulation()
+
 
 
 def setup_drawing(canvas, power_preference="high-performance"):
@@ -195,8 +238,12 @@ def get_draw_function(
 
         angles = np.arange(point_resolution + 1) / point_resolution * 2 * np.pi
         a_offsets = np.zeros(shape=(point_resolution, 2), dtype=float)
-        b_offsets = np.stack([np.cos(angles[:-1]), np.sin(angles[:-1])], axis=-1) * 0.02
-        c_offsets = np.stack([np.cos(angles[1:]), np.sin(angles[1:])], axis=-1) * 0.02
+        b_offsets = (
+            np.stack([np.cos(angles[:-1]), np.sin(angles[:-1])], axis=-1) * point_radius
+        )
+        c_offsets = (
+            np.stack([np.cos(angles[1:]), np.sin(angles[1:])], axis=-1) * point_radius
+        )
         offsets = np.stack([a_offsets, b_offsets, c_offsets], axis=-2)
         vertices[:] = (
             positions.reshape((number_of_points, 1, 2))
