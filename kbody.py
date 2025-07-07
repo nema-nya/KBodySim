@@ -3,7 +3,7 @@ from ffmpeg_writer import FfmpegWriter
 from wgpu_renderer import WgpuRenderer
 import dataclasses
 
-number_of_points = 25
+number_of_points = 50
 point_resolution = 32
 window_width = 1024
 window_height = 1024
@@ -12,7 +12,7 @@ point_radius = separation
 gravitational_constant = 0.001
 substeps = 16
 dt = 0.1 / substeps
-frame_count = 60
+frame_count = 2
 pole_distance = 0.1
 
 
@@ -138,13 +138,63 @@ class QuadTree:
         return accel
 
 
+class QuadTreeV2:
+    def _find_power_of_two(self, n):
+        n -= 1
+        n = n | (n >> 1)
+        n = n | (n >> 2)
+        n = n | (n >> 4)
+        n = n | (n >> 8)
+        n = n | (n >> 16)
+        n = n | (n >> 32)
+        n += 1
+        return n
+
+    def __init__(self, positions, separation, pole_distance):
+        self.bounding_box = (*positions.min(0), *positions.max(0))
+        self.separation = separation
+        self.pole_distance = pole_distance
+        indicies = positions
+        indicies = (indicies - indicies.min(0, keepdims=True)) / (
+            indicies.max(0, keepdims=True) - indicies.min(0, keepdims=True)
+        )
+        indicies = (indicies / separation).astype(np.uint32)
+
+        stride_x = np.ceil(
+            (self.bounding_box[2] - self.bounding_box[0]) / self.separation
+        ).astype(np.uint32)
+        stride_y = np.ceil(
+            (self.bounding_box[3] - self.bounding_box[1]) / self.separation
+        ).astype(np.uint32)
+        stride = max(stride_x, stride_y)
+
+        points = np.arange(len(positions))
+        leaves = indicies[:, 0] * stride + indicies[:, 1]
+        ixs = np.argsort(leaves)
+        points = points[ixs]
+        indicies = indicies[ixs]
+
+        p = self._find_power_of_two(stride)
+        levels = []
+        level_sizes = []
+        while p > 0:
+            buckets = indicies[:, 0] * stride + indicies[:, 1]
+            levels.append(buckets)
+            indicies = indicies // 2
+            p = p // 2 
+            level_sizes.append(len(np.unique_values(buckets)))
+        nodes = np.zeros(shape=(sum(level_sizes), ), dtype=np.dtype("4u4,u4,u4"))
+        print(nodes)
+
 class Simulation:
     def __init__(self):
         self.positions = (np.random.rand(number_of_points, 2) * 2 - 1) * (
             1 - separation
         )
+
         self.positions = self.positions.astype(np.float32)
         for _ in range(substeps):
+            QuadTreeV2(self.positions, separation * 2, pole_distance)
             quad_tree = QuadTree(
                 (*self.positions.min(0), *self.positions.max(0)),
                 separation * 2,
