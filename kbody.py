@@ -5,9 +5,6 @@ import dataclasses
 
 number_of_points = 25
 point_resolution = 32
-vertices = np.empty(
-    shape=(point_resolution * number_of_points * 3, 2), dtype=np.float32
-)
 window_width = 1024
 window_height = 1024
 separation = 0.01
@@ -146,6 +143,7 @@ class Simulation:
         self.positions = (np.random.rand(number_of_points, 2) * 2 - 1) * (
             1 - separation
         )
+        self.positions = self.positions.astype(np.float32)
         for _ in range(substeps):
             quad_tree = QuadTree(
                 (*self.positions.min(0), *self.positions.max(0)),
@@ -189,7 +187,7 @@ class Simulation:
             )
             for i in range(number_of_points):
                 quad_tree.add_point(i, self.positions[i])
-            accel = np.zeros(shape=(number_of_points, 2), dtype=float)
+            accel = np.zeros(shape=(number_of_points, 2), dtype=np.float32)
             for i in range(number_of_points):
                 accel[i] = quad_tree.get_gravity(self.positions[i])
             self.resolve_colisions(quad_tree)
@@ -211,7 +209,6 @@ if __name__ == "__main__":
     wgpu_renderer = WgpuRenderer(
         window_width,
         window_height,
-        vertices,
         simulation,
         point_resolution,
         point_radius,

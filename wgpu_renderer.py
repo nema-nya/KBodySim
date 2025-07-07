@@ -2,6 +2,23 @@ import wgpu
 from wgpu.gui.auto import WgpuCanvas, run
 import numpy as np
 
+compute_shader_source = """
+    @group(0) @binding(0) var<storage, read>  positions: array<vec2<f32>>;
+    @group(0) @binding(1) var<storage, read_write> verticies: array<vec2<f32>>;
+    override point_resolution: u32;
+    override point_radius: f32;
+    @compute @workgroup_size(1, 1, 1) fn generate_verticies(@builtin(global_invocation_id) id: vec3<u32>) {
+        let i = id.x;
+        let pi = acos(-1.0);
+        let pos = positions[i];
+        for (var j = 0u; j < point_resolution; j++) {
+            verticies[i * point_resolution * 3u + j * 3u + 0u] = pos;
+            verticies[i * point_resolution * 3u + j * 3u + 1u] = pos + vec2<f32>(cos(f32(j) / f32(point_resolution) * 2 * pi), sin(f32(j) / f32(point_resolution) * 2 * pi)) * point_radius;
+            verticies[i * point_resolution * 3u + j * 3u + 2u] = pos + vec2<f32>(cos(f32(j + 1u) / f32(point_resolution) * 2 * pi), sin(f32(j + 1u) / f32(point_resolution) * 2 * pi)) * point_radius;
+        }
+    }
+"""
+
 shader_source = """
     struct VertexInput {
         @location(0) pos : vec2<f32>,
@@ -43,95 +60,109 @@ class WgpuRenderer:
         self,
         window_width,
         window_height,
-        vertices,
         simluation,
         point_resolution,
         point_radius,
         number_of_points,
         title="wgpu renderer",
     ):
-        self.vertices = vertices
         self.window_width = window_width
         self.window_height = window_height
         self.simulation = simluation
         self.point_resolution = point_resolution
         self.point_radius = point_radius
         self.number_of_points = number_of_points
-        canvas = WgpuCanvas(
+        self.canvas = WgpuCanvas(
             size=(window_width, window_height), title=title, max_fps=1000, vsync=False
         )
-        draw_frame = self.setup_drawing(canvas)
-        canvas.request_draw(draw_frame)
+        draw_frame = self.setup_drawing()
+        self.canvas.request_draw(draw_frame)
         run()
 
-    def setup_drawing(self, canvas, power_preference="high-performance"):
+    def setup_drawing(self, power_preference="high-performance"):
         adapter = wgpu.gpu.request_adapter_sync(power_preference=power_preference)
-        device = adapter.request_device_sync(required_limits=None)
-        context = canvas.get_context("wgpu")
-        pipeline_kwargs = self.get_render_pipeline_kwargs(context, device)
-        render_pipeline = device.create_render_pipeline(**pipeline_kwargs)
-
-        vertex_buffer = device.create_buffer(
-            size=len(self.vertices) * 2 * 4,
-            usage=wgpu.BufferUsage.VERTEX + wgpu.BufferUsage.COPY_DST,
+        self.device = adapter.request_device_sync(required_limits=None)
+        self.context = self.canvas.get_context("wgpu")
+        self.context.configure(device=self.device, format=None)
+        compute_pipeline_kwargs = self.get_compute_pipeline_kwargs()
+        pipeline_kwargs = self.get_render_pipeline_kwargs()
+        self.compute_pipeline = self.device.create_compute_pipeline(
+            **compute_pipeline_kwargs
         )
-        vertex_buffer_staging = device.create_buffer(
-            size=len(self.vertices) * 2 * 4,
+        self.render_pipeline = self.device.create_render_pipeline(**pipeline_kwargs)
+
+        self.positions_buffer = self.device.create_buffer(
+            size=self.number_of_points * 2 * 4,
+            usage=wgpu.BufferUsage.COPY_DST + wgpu.BufferUsage.STORAGE,
+        )
+        self.positions_buffer_staging = self.device.create_buffer(
+            size=self.number_of_points * 2 * 4,
             usage=wgpu.BufferUsage.MAP_WRITE + wgpu.BufferUsage.COPY_SRC,
         )
 
+        self.vertex_buffer = self.device.create_buffer(
+            size=self.number_of_points * self.point_resolution * 3 * 2 * 4,
+            usage=wgpu.BufferUsage.COPY_DST + wgpu.BufferUsage.VERTEX,
+        )
+        self.vertex_buffer_staging = self.device.create_buffer(
+            size=self.number_of_points * self.point_resolution * 3 * 2 * 4,
+            usage=wgpu.BufferUsage.COPY_SRC + wgpu.BufferUsage.STORAGE,
+        )
+
         width_blocks = (self.window_width * 4 + 255) // 256
-        color_output_buffer = device.create_buffer(
+        self.color_output_buffer = self.device.create_buffer(
             size=width_blocks * 256 * self.window_height,
             usage=wgpu.BufferUsage.COPY_DST + wgpu.BufferUsage.MAP_READ,
         )
 
-        color_texture = device.create_texture(
-            format=context.get_preferred_format(device.adapter),
+        self.color_texture = self.device.create_texture(
+            format=self.context.get_preferred_format(self.device.adapter),
             usage=wgpu.TextureUsage.RENDER_ATTACHMENT,
             size={"width": self.window_width, "height": self.window_height},
             sample_count=4,
         )
 
-        color_resolve_texture = device.create_texture(
-            format=context.get_preferred_format(device.adapter),
+        self.color_resolve_texture = self.device.create_texture(
+            format=self.context.get_preferred_format(self.device.adapter),
             usage=wgpu.TextureUsage.RENDER_ATTACHMENT + wgpu.TextureUsage.COPY_SRC,
             size={"width": self.window_width, "height": self.window_height},
             sample_count=1,
         )
 
-        present_multisampled_texture = device.create_texture(
-            format=context.get_preferred_format(device.adapter),
+        self.present_multisampled_texture = self.device.create_texture(
+            format=self.context.get_preferred_format(self.device.adapter),
             usage=wgpu.TextureUsage.RENDER_ATTACHMENT,
             size={"width": self.window_width, "height": self.window_height},
             sample_count=4,
         )
 
-        return self.get_draw_function(
-            canvas,
-            context,
-            device,
-            render_pipeline,
-            vertex_buffer,
-            vertex_buffer_staging,
-            color_output_buffer,
-            color_texture,
-            color_resolve_texture,
-            present_multisampled_texture,
+        return self.get_draw_function()
+
+    def get_compute_pipeline_kwargs(self):
+        shader = self.device.create_shader_module(code=compute_shader_source)
+        return dict(
+            layout=wgpu.enums.AutoLayoutMode.auto,
+            compute={
+                "module": shader,
+                "entry_point": "generate_verticies",
+                "constants": {
+                    "point_radius": self.point_radius,
+                    "point_resolution": self.point_resolution,
+                },
+            },
         )
 
-    def get_render_pipeline_kwargs(self, context, device):
-        context.configure(device=device, format=None)
-        render_texture_format = context.get_preferred_format(device.adapter)
-        shader = device.create_shader_module(code=shader_source)
-        pipeline_layout = device.create_pipeline_layout(bind_group_layouts=[])
+    def get_render_pipeline_kwargs(self):
+        render_texture_format = self.context.get_preferred_format(self.device.adapter)
+        shader = self.device.create_shader_module(code=shader_source)
+        pipeline_layout = self.device.create_pipeline_layout(bind_group_layouts=[])
 
         return dict(
             layout=pipeline_layout,
             vertex={
                 "buffers": [
                     {
-                        "array_stride": 8,
+                        "array_stride": 2 * 4,
                         "attributes": [
                             {
                                 "format": wgpu.VertexFormat.float32x2,
@@ -171,77 +202,74 @@ class WgpuRenderer:
             },
         )
 
-    def get_draw_function(
-        self,
-        canvas,
-        context,
-        device,
-        render_pipeline,
-        vertex_buffer,
-        vertex_buffer_staging,
-        color_output_buffer,
-        color_texture,
-        color_resolve_texture,
-        present_multisampled_texture,
-    ):
+    def get_draw_function(self):
         def draw_frame():
             positions = self.simulation.start_frame()
             if positions is None:
-                canvas.close()
+                self.canvas.close()
                 return
 
-            angles = (
-                np.arange(self.point_resolution + 1) / self.point_resolution * 2 * np.pi
-            )
-            a_offsets = np.zeros(shape=(self.point_resolution, 2), dtype=float)
-            b_offsets = (
-                np.stack([np.cos(angles[:-1]), np.sin(angles[:-1])], axis=-1)
-                * self.point_radius
-            )
-            c_offsets = (
-                np.stack([np.cos(angles[1:]), np.sin(angles[1:])], axis=-1)
-                * self.point_radius
-            )
-            offsets = np.stack([a_offsets, b_offsets, c_offsets], axis=-2)
-            self.vertices[:] = (
-                positions.reshape((self.number_of_points, 1, 2))
-                + offsets.reshape((1, self.point_resolution * 3, 2))
-            ).reshape((self.number_of_points * self.point_resolution * 3, 2))
-            vertex_buffer_staging.map_sync(wgpu.MapMode.WRITE)
-            vertex_buffer_staging.write_mapped(self.vertices)
-            vertex_buffer_staging.unmap()
-            current_texture = context.get_current_texture()
-            command_encoder = device.create_command_encoder()
+            current_texture = self.context.get_current_texture()
+
+            command_encoder = self.device.create_command_encoder()
+
+            self.positions_buffer_staging.map_sync(wgpu.MapMode.WRITE)
+            self.positions_buffer_staging.write_mapped(positions)
+            self.positions_buffer_staging.unmap()
+
             command_encoder.copy_buffer_to_buffer(
-                source=vertex_buffer_staging,
+                source=self.positions_buffer_staging,
                 source_offset=0,
-                destination=vertex_buffer,
+                destination=self.positions_buffer,
                 destination_offset=0,
-                size=len(self.vertices) * 2 * 4,
+                size=self.number_of_points * 2 * 4,
             )
+
+            bind_group = self.device.create_bind_group(
+                layout=self.compute_pipeline.get_bind_group_layout(0),
+                entries=[
+                    {"binding": 0, "resource": {"buffer": self.positions_buffer}},
+                    {"binding": 1, "resource": {"buffer": self.vertex_buffer_staging}},
+                ],
+            )
+
+            compute_pass = command_encoder.begin_compute_pass()
+            compute_pass.set_pipeline(self.compute_pipeline)
+            compute_pass.set_bind_group(0, bind_group)
+            compute_pass.dispatch_workgroups(self.number_of_points)
+            compute_pass.end()
+
+            command_encoder.copy_buffer_to_buffer(
+                source=self.vertex_buffer_staging,
+                source_offset=0,
+                destination=self.vertex_buffer,
+                destination_offset=0,
+                size=self.number_of_points * self.point_resolution * 3 * 4,
+            )
+
             render_pass = command_encoder.begin_render_pass(
                 color_attachments=[
                     {
-                        "view": present_multisampled_texture.create_view(),
+                        "view": self.present_multisampled_texture.create_view(),
                         "resolve_target": current_texture.create_view(),
                         "clear_value": (0, 0, 0, 1),
                         "load_op": wgpu.LoadOp.clear,
                         "store_op": wgpu.StoreOp.store,
                     },
                     {
-                        "view": color_texture.create_view(),
-                        "resolve_target": color_resolve_texture.create_view(),
+                        "view": self.color_texture.create_view(),
+                        "resolve_target": self.color_resolve_texture.create_view(),
                         "clear_value": (0, 0, 0, 1),
                         "load_op": wgpu.LoadOp.clear,
                         "store_op": wgpu.StoreOp.store,
                     },
                 ],
             )
-            render_pass.set_pipeline(render_pipeline)
+            render_pass.set_pipeline(self.render_pipeline)
             render_pass.set_vertex_buffer(
-                slot=0, buffer=vertex_buffer, offset=0, size=None
+                slot=0, buffer=self.vertex_buffer, offset=0, size=None
             )
-            render_pass.draw(len(self.vertices), 1, 0, 0)
+            render_pass.draw(self.number_of_points * self.point_resolution * 3, 1, 0, 0)
             render_pass.end()
 
             width_blocks = (self.window_width * 4 + 255) // 256
@@ -250,27 +278,27 @@ class WgpuRenderer:
                     "aspect": wgpu.TextureAspect.all,
                     "mip_level": 0,
                     "origin": {"x": 0, "y": 0, "z": 0},
-                    "texture": color_resolve_texture,
+                    "texture": self.color_resolve_texture,
                 },
                 {
-                    "buffer": color_output_buffer,
+                    "buffer": self.color_output_buffer,
                     "bytes_per_row": width_blocks * 256,
                     "offset": 0,
                 },
                 {"width": current_texture.width, "height": current_texture.height},
             )
 
-            device.queue.submit([command_encoder.finish()])
+            self.device.queue.submit([command_encoder.finish()])
 
-            color_output_buffer.map_sync(wgpu.MapMode.READ)
-            image_mem = color_output_buffer.read_mapped()
-            color_output_buffer.unmap()
+            self.color_output_buffer.map_sync(wgpu.MapMode.READ)
+            image_mem = self.color_output_buffer.read_mapped()
+            self.color_output_buffer.unmap()
             padding = width_blocks * 256 - self.window_width * 4
             image_bytes_padded = np.frombuffer(
                 image_mem.tobytes(), dtype=np.byte
             ).reshape((self.window_height, self.window_width + padding, 4))
             image_array = image_bytes_padded[:, : self.window_width, :]
             self.simulation.end_frame(image_array)
-            canvas.request_draw(draw_frame)
+            self.canvas.request_draw(draw_frame)
 
         return draw_frame
