@@ -244,7 +244,7 @@ class WgpuRenderer:
                 source_offset=0,
                 destination=self.vertex_buffer,
                 destination_offset=0,
-                size=self.number_of_points * self.point_resolution * 3 * 4,
+                size=self.number_of_points * self.point_resolution * 3 * 2 * 4,
             )
 
             render_pass = command_encoder.begin_render_pass(

@@ -3,17 +3,19 @@ from ffmpeg_writer import FfmpegWriter
 from wgpu_renderer import WgpuRenderer
 import dataclasses
 
-number_of_points = 50
+number_of_points = 25
 point_resolution = 32
 window_width = 1024
 window_height = 1024
 separation = 0.01
 point_radius = separation
-gravitational_constant = 0.001
-substeps = 16
-dt = 0.1 / substeps
-frame_count = 2
-pole_distance = 0.1
+gravitational_constant = 0.0001
+substeps = 8
+dt = 0.01
+frame_count = 60
+pole_distance = 1
+spawn_radius = 1
+initial_spin = 0.001
 
 
 @dataclasses.dataclass
@@ -106,20 +108,16 @@ class QuadTree:
             r = node.mass_center - position
             r_len = np.linalg.norm(r)
             if bb[0] >= position[0] + self.pole_distance:
-                if r_len > self.separation:
-                    accel += r / r_len**3 * gravitational_constant * node.mass
+                accel += r / r_len**3 * gravitational_constant * node.mass
                 continue
             elif bb[1] >= position[1] + self.pole_distance:
-                if r_len > self.separation:
-                    accel += r / r_len**3 * gravitational_constant * node.mass
+                accel += r / r_len**3 * gravitational_constant * node.mass
                 continue
             elif bb[2] < position[0] - self.pole_distance:
-                if r_len > self.separation:
-                    accel += r / r_len**3 * gravitational_constant * node.mass
+                accel += r / r_len**3 * gravitational_constant * node.mass
                 continue
             elif bb[3] < position[1] - self.pole_distance:
-                if r_len > self.separation:
-                    accel += r / r_len**3 * gravitational_constant * node.mass
+                accel += r / r_len**3 * gravitational_constant * node.mass
                 continue
             if node.top_left is not None:
                 queue.append(node.top_left)
@@ -133,9 +131,47 @@ class QuadTree:
             for _, point_position in node.points:
                 r = point_position - position
                 r_len = np.linalg.norm(r)
-                if r_len > self.separation:
-                    accel += r / r_len**3 * gravitational_constant
+                if r_len < self.separation:
+                    continue
+                accel += r / r_len**3 * gravitational_constant
         return accel
+
+    def get_potential(self, position):
+        pot = 0
+        queue = [self.root]
+        while queue:
+            node = queue.pop()
+            bb = node.bounding_box
+            r = node.mass_center - position
+            r_len = np.linalg.norm(r)
+            if bb[0] >= position[0] + self.pole_distance:
+                pot += gravitational_constant * node.mass / r_len
+                continue
+            elif bb[1] >= position[1] + self.pole_distance:
+                pot += gravitational_constant * node.mass / r_len
+                continue
+            elif bb[2] < position[0] - self.pole_distance:
+                pot += gravitational_constant * node.mass / r_len
+                continue
+            elif bb[3] < position[1] - self.pole_distance:
+                pot += gravitational_constant * node.mass / r_len
+                continue
+            if node.top_left is not None:
+                queue.append(node.top_left)
+            if node.top_right is not None:
+                queue.append(node.top_right)
+            if node.bottom_left is not None:
+                queue.append(node.bottom_left)
+            if node.bottom_right is not None:
+                queue.append(node.bottom_right)
+
+            for _, point_position in node.points:
+                r = point_position - position
+                r_len = np.linalg.norm(r)
+                if r_len < self.separation:
+                    continue
+                pot += gravitational_constant / r_len
+        return -pot
 
 
 class QuadTreeV2:
@@ -176,23 +212,60 @@ class QuadTreeV2:
 
         p = self._find_power_of_two(stride)
         levels = []
-        level_sizes = []
-        while p > 0:
+        node_buckets = []
+        node_levels = []
+        while p > 1:
             buckets = indicies[:, 0] * stride + indicies[:, 1]
             levels.append(buckets)
             indicies = indicies // 2
-            p = p // 2 
-            level_sizes.append(len(np.unique_values(buckets)))
-        nodes = np.zeros(shape=(sum(level_sizes), ), dtype=np.dtype("4u4,u4,u4"))
-        print(nodes)
+            p = p // 2
+            node_buckets.append(np.unique_values(buckets))
+
+        for i in range(len(levels)):
+            node_levels.append(
+                np.ones(shape=(len(node_buckets[i]),), dtype=np.uint32)
+                * (len(levels) - i - 1)
+            )
+
+        node_levels = np.concat(node_levels)
+        node_buckets = np.concat(node_buckets)
+        node_buckets = node_buckets * len(levels) + node_levels
+        node_perm = np.argsort(node_buckets)
+        node_buckets = node_buckets[node_perm]
+
+        node_levels = node_buckets % len(levels)
+        node_xys = node_buckets // len(levels)
+        node_ys = node_xys % stride
+        node_xs = node_xys // stride
+
+        def node_to_child(x_off, y_off):
+            children = ((node_xs * 2 + x_off) * stride + (node_ys * 2 + y_off)) * len(
+                levels
+            ) + (node_levels + 1)
+            mask_valid = np.isin(children, node_buckets)
+            mask_level = node_levels != (len(levels) - 1)
+            mask = mask_valid & mask_level
+            child_buckets = children[mask]
+            child_indicies = np.argwhere(np.isin(node_buckets, child_buckets)).ravel()
+            children[mask] = child_indicies
+            children = np.where(mask, children, np.zeros_like(children))
+            return children
+
+        node_top_lefts = node_to_child(0, 0)
+        node_top_rights = node_to_child(1, 0)
+        node_bottom_lefts = node_to_child(0, 1)
+        node_bottom_rights = node_to_child(1, 1)
+
 
 class Simulation:
     def __init__(self):
-        self.positions = (np.random.rand(number_of_points, 2) * 2 - 1) * (
-            1 - separation
+        self.positions = (
+            (np.random.rand(number_of_points, 2) * 2 - 1)
+            * (1 - separation)
+            * spawn_radius
         )
-
         self.positions = self.positions.astype(np.float32)
+        self.prev_positions = np.zeros_like(self.positions)
         for _ in range(substeps):
             QuadTreeV2(self.positions, separation * 2, pole_distance)
             quad_tree = QuadTree(
@@ -205,7 +278,7 @@ class Simulation:
             self.resolve_colisions(quad_tree)
         velocity = np.stack([self.positions[:, 1], -self.positions[:, 0]], axis=-1)
         velocity = velocity / np.linalg.norm(velocity, axis=-1, keepdims=True)
-        self.prev_positions = self.positions + velocity * dt * 0.06
+        self.prev_positions = self.positions + velocity * dt * initial_spin
         self.frame_count = frame_count
 
     def end_frame(self, image_array):
@@ -215,12 +288,11 @@ class Simulation:
         delta = np.zeros_like(self.positions)
         for i in range(number_of_points):
             for j in quad_tree.get_colisions(self.positions[i]):
-                if j == i:
+                if i == j:
                     continue
                 r = self.positions[j] - self.positions[i]
                 r_len = np.linalg.norm(r)
-                if r_len < 2 * separation and r_len > 1e-5:
-                    delta[i] -= r / r_len * (2 * separation - r_len) / 2
+                delta[i] -= r / r_len * (2 * separation - r_len) / 2
         self.positions += delta
 
     def recenter_view(self):
@@ -229,6 +301,11 @@ class Simulation:
         self.prev_positions -= mean_position
 
     def start_frame(self):
+        quad_tree = QuadTree(
+            (*self.positions.min(0), *self.positions.max(0)),
+            separation * 2,
+            pole_distance,
+        )
         for _ in range(substeps):
             quad_tree = QuadTree(
                 (*self.positions.min(0), *self.positions.max(0)),
@@ -240,11 +317,25 @@ class Simulation:
             accel = np.zeros(shape=(number_of_points, 2), dtype=np.float32)
             for i in range(number_of_points):
                 accel[i] = quad_tree.get_gravity(self.positions[i])
-            self.resolve_colisions(quad_tree)
             self.positions, self.prev_positions = (
                 2 * self.positions - self.prev_positions + dt**2 * accel,
                 self.positions,
             )
+            quad_tree = QuadTree(
+                (*self.positions.min(0), *self.positions.max(0)),
+                separation * 2,
+                pole_distance,
+            )
+            for i in range(number_of_points):
+                quad_tree.add_point(i, self.positions[i])
+            self.resolve_colisions(quad_tree)
+
+        e_kin = 0
+        for i in range(number_of_points):
+            e_kin += (
+                np.linalg.norm(self.positions[i] - self.prev_positions[i]) / dt
+            ) ** 2 / 2
+
         self.recenter_view()
         if self.frame_count > 0:
             self.frame_count -= 1
