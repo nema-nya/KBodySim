@@ -3,7 +3,7 @@ from ffmpeg_writer import FfmpegWriter
 from wgpu_renderer import WgpuRenderer
 import dataclasses
 
-number_of_points = 4
+number_of_points = 25
 point_resolution = 32
 window_width = 1024
 window_height = 1024
@@ -194,7 +194,7 @@ class QuadTreeV2:
         self.separation = separation
         self.pole_distance = pole_distance
         indicies = positions
-        indicies = (indicies - indicies.min(0, keepdims=True))
+        indicies = indicies - indicies.min(0, keepdims=True)
         indicies = (indicies / separation).astype(np.uint32)
 
         stride_x = np.ceil(
@@ -234,7 +234,6 @@ class QuadTreeV2:
             indicies = indicies // 2
             p = p // 2
             node_buckets.append(np.unique_values(buckets))
-            print(f"at power {p} added {len(node_buckets[-1])} buckets {buckets}")
 
         for i in range(len(levels)):
             if i == 0:
@@ -250,7 +249,6 @@ class QuadTreeV2:
                 np.ones(shape=(len(node_buckets[i]),), dtype=np.uint32)
                 * (len(levels) - i - 1)
             )
-            print(f"at level {len(levels) - 1 - i} - we have {len(node_levels[i])} nodes")
 
         node_levels = np.concat(node_levels)
         node_buckets = np.concat(node_buckets)
@@ -269,7 +267,6 @@ class QuadTreeV2:
         node_xys = node_buckets // (len(levels) + 1)
         node_ys = node_xys % stride
         node_xs = node_xys // stride
-        print(list(zip(node_levels.tolist(), node_ys.tolist(), node_xs.tolist())))
 
         def node_to_child(x_off, y_off):
             children = ((node_xs * 2 + x_off) * stride + (node_ys * 2 + y_off)) * (
@@ -411,8 +408,6 @@ class QuadTreeV2:
         deltas = np.zeros_like(self.positions)
         stack = np.zeros(shape=(len(deltas), 4 * self.depth), dtype=np.uint32)
         stack_depth = np.ones(shape=(len(deltas),), dtype=np.uint32)
-        collisions = {}
-        misses = {}
         while True:
             mask_stack = stack_depth != 0
             if np.count_nonzero(mask_stack) == 0:
@@ -451,29 +446,6 @@ class QuadTreeV2:
                 np.logical_and(mask_bottom, mask_top),
             )
 
-            def get_node_points(n):
-                res = []
-                if self.node_top_lefts[n] != 0:
-                    res += get_node_points(self.node_top_lefts[n])
-                if self.node_top_rights[n] != 0:
-                    res += get_node_points(self.node_top_rights[n])
-                if self.node_bottom_lefts[n] != 0:
-                    res += get_node_points(self.node_bottom_lefts[n])
-                if self.node_bottom_rights[n] != 0:
-                    res += get_node_points(self.node_bottom_rights[n])
-                for p in range(self.node_firsts[n], self.node_ends[n]):
-                    res.append(p)
-                return res
-
-            ix = np.arange(len(self.positions))
-            ix = ix[mask_stack]
-            for i in range(len(ix)):
-                if not mask_branch[i]:
-                    # print(f"point - {ix[i]} not checking node {current_stack[i, current_stack_depth[i]]}, {get_node_points(current_stack[i, current_stack_depth[i]])}")
-                    for p in get_node_points(current_stack[i, current_stack_depth[i]]):
-                        misses[(ix[i], p)] = (
-                            f"skipped node {current_stack[i, current_stack_depth[i]]}"
-                        )
             skip_depth = current_stack_depth.copy()
             mask_top_left = current_top_lefts != 0
             np.put_along_axis(
@@ -537,25 +509,6 @@ class QuadTreeV2:
                     / 2,
                     np.zeros_like(step_overlap),
                 )
-                ix = np.arange(len(self.positions))
-                ix = ix[mask_stack]
-                ix = ix[mask]
-                for i in range(len(ix)):
-                    if mask_collision[i] and step_firsts[i] != ix[i]:
-                        collisions[(ix[i].item(), step_firsts[i].item())] = (
-                            step_distances[i].item()
-                        )
-                    elif not mask_collision[i]:
-                        misses[(ix[i].item(), step_firsts[i].item())] = (
-                            f"mask collision"
-                        )
-                    if (
-                        not mask_collision[i]
-                        or step_firsts[i] == ix[i]
-                        or step_distances[i] > 0.016
-                    ):
-                        continue
-                    # print(ix[i], step_firsts[i], step_distances[i], step_deltas[i])
                 step_firsts += 1
                 current_firsts_i[mask] = step_firsts
                 current_deltas[mask] = step_deltas
@@ -565,19 +518,6 @@ class QuadTreeV2:
             stack_depth[mask_stack] = current_stack_depth
             stack[mask_stack] = current_stack
             deltas[mask_stack] = current_deltas
-        for k, v in collisions.items():
-            k_ = (k[1], k[0])
-            if k_ not in collisions:
-                for i in range(len(self.node_levels)):
-                    print(
-                        i,
-                        self.node_top_lefts[i],
-                        self.node_top_rights[i],
-                        self.node_bottom_lefts[i],
-                        self.node_bottom_rights[i],
-                        get_node_points(i),
-                    )
-                raise RuntimeError(f"{k,v} - {misses.get(k_, None)}")
         return deltas
 
     def get_gravity(self):
