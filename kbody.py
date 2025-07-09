@@ -291,6 +291,9 @@ class QuadTreeV2:
         for i in range(4):
             node_bbs[:, i] = self.bounding_box[[2, 3, 0, 1][i]]
 
+        node_masses = np.zeros(shape=(len(node_buckets),))
+        node_mass_centers = np.zeros(shape=(len(node_buckets), 2))
+
         node_firsts_i = node_firsts.copy()
         while True:
             mask_level = node_levels == (tree_depth - 1)
@@ -300,6 +303,8 @@ class QuadTreeV2:
                 break
             current_firsts = node_firsts_i[mask]
             current_bbs = node_bbs[mask]
+            current_masses = node_masses[mask]
+            current_mass_centers = node_mass_centers[mask]
             current_positions = np.take_along_axis(
                 positions, current_firsts[:, None], axis=0
             )
@@ -323,9 +328,16 @@ class QuadTreeV2:
                 current_positions[:, 1],
                 current_bbs[:, 3],
             )
+            current_mass_centers = (
+                current_mass_centers * current_masses[:, None] + current_positions
+            ) / (current_masses[:, None] + 1)
+            current_masses += 1
             current_firsts += 1
             node_firsts_i[mask] = current_firsts
             node_bbs[mask] = current_bbs
+            node_masses[mask] = current_masses
+            node_mass_centers[mask] = current_mass_centers
+
         for i in range(tree_depth - 1):
             for children in [
                 node_top_lefts,
@@ -342,7 +354,16 @@ class QuadTreeV2:
                 current_child_bbs = np.take_along_axis(
                     node_bbs, current_children[:, None], axis=0
                 )
+                current_child_masses = np.take_along_axis(
+                    node_masses, current_children, axis=0
+                )
+                current_child_mass_centers = np.take_along_axis(
+                    node_mass_centers, current_children[:, None], axis=0
+                )
                 current_bbs = node_bbs[mask]
+                current_masses = node_masses[mask]
+                current_mass_centers = node_mass_centers[mask]
+
                 current_bbs[:, 0] = np.where(
                     current_child_bbs[:, 0] < current_bbs[:, 0],
                     current_child_bbs[:, 0],
@@ -363,10 +384,18 @@ class QuadTreeV2:
                     current_child_bbs[:, 3],
                     current_bbs[:, 3],
                 )
+                current_mass_centers = (
+                    current_mass_centers * current_masses[:, None]
+                    + current_child_mass_centers * current_child_masses[:, None]
+                ) / (current_masses[:, None] + current_child_masses[:, None])
+                current_masses += current_child_masses
                 node_bbs[mask] = current_bbs
+                node_masses[mask] = current_masses
+                node_mass_centers[mask] = current_mass_centers
 
 
 class Simulation:
+
     def __init__(self):
         self.positions = (
             (np.random.rand(number_of_points, 2) * 2 - 1)
