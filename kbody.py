@@ -3,18 +3,18 @@ from ffmpeg_writer import FfmpegWriter
 from wgpu_renderer import WgpuRenderer
 import dataclasses
 
-number_of_points = 10
+number_of_points = 25
 point_resolution = 32
 window_width = 1024
 window_height = 1024
 separation = 0.01
 point_radius = separation
-gravitational_constant = 0.0001
+gravitational_constant = 0.001
 substeps = 8
-dt = 0.01
-frame_count = 5
+dt = 0.001
+frame_count = 900
 pole_distance = 1
-spawn_radius = 0.5
+spawn_radius = 0.2
 initial_spin = 0.001
 pows = [2**i for i in range(32)]
 pow_to_p = {p: i for i, p in enumerate(pows)}
@@ -72,7 +72,7 @@ class QuadTree:
                     node.bottom_right = QuadTreeNode((vert, hori, bb[2], bb[3]))
                 node = node.bottom_right
 
-    def get_colisions(self, position):
+    def get_collisions(self, position):
         queue = [self.root]
         result = []
         while queue:
@@ -189,6 +189,7 @@ class QuadTreeV2:
         return n
 
     def __init__(self, positions, separation, pole_distance):
+        self.positions = positions
         self.bounding_box = (*positions.min(0), *positions.max(0))
         self.separation = separation
         self.pole_distance = pole_distance
@@ -393,6 +394,155 @@ class QuadTreeV2:
                 node_masses[mask] = current_masses
                 node_mass_centers[mask] = current_mass_centers
 
+                self.node_bbs = node_bbs
+                self.node_top_lefts = node_top_lefts
+                self.node_top_rights = node_top_rights
+                self.node_bottom_lefts = node_bottom_lefts
+                self.node_bottom_rights = node_bottom_rights
+                self.node_masses = node_masses
+                self.node_mass_centers = node_mass_centers
+                self.node_levels = node_levels
+                self.depth = tree_depth
+                self.node_firsts = node_firsts
+                self.node_ends = node_ends
+
+    def get_collisions(self):
+        deltas = np.zeros_like(self.positions)
+        stack = np.zeros(shape=(len(deltas), 4 * self.depth), dtype=np.uint32)
+        stack_depth = np.ones(shape=(len(deltas),), dtype=np.uint32)
+        collisions = {}
+        while True:
+            mask_stack = stack_depth != 0
+            if np.count_nonzero(mask_stack) == 0:
+                break
+            current_deltas = deltas[mask_stack]
+            current_positions = self.positions[mask_stack]
+            current_stack = stack[mask_stack]
+            current_stack_depth = stack_depth[mask_stack]
+            current_stack_depth -= 1
+            current_nodes = np.take_along_axis(
+                current_stack, current_stack_depth[:, None], axis=-1
+            ).ravel()
+            current_bbs = np.take_along_axis(
+                self.node_bbs, current_nodes[:, None], axis=0
+            )
+            current_top_lefts = np.take_along_axis(
+                self.node_top_lefts, current_nodes, axis=0
+            )
+            current_top_rights = np.take_along_axis(
+                self.node_top_rights, current_nodes, axis=0
+            )
+            current_bottom_lefts = np.take_along_axis(
+                self.node_bottom_lefts, current_nodes, axis=0
+            )
+            current_bottom_rights = np.take_along_axis(
+                self.node_bottom_rights, current_nodes, axis=0
+            )
+            current_firsts = np.take_along_axis(self.node_firsts, current_nodes, axis=0)
+            current_ends = np.take_along_axis(self.node_ends, current_nodes, axis=0)
+            mask_left = current_bbs[:, 0] < current_positions[:, 0] + self.separation
+            mask_right = current_bbs[:, 2] >= current_positions[:, 0] - self.separation
+            mask_bottom = current_bbs[:, 1] < current_positions[:, 1] + self.separation
+            mask_top = current_bbs[:, 3] >= current_positions[:, 1] - self.separation
+            mask_branch = np.logical_and(
+                np.logical_and(mask_left, mask_right),
+                np.logical_and(mask_bottom, mask_top),
+            )
+
+            skip_depth = current_stack_depth.copy()
+            mask_top_left = current_top_lefts != 0
+            np.put_along_axis(
+                current_stack,
+                current_stack_depth[:, None],
+                current_top_lefts[:, None],
+                axis=-1,
+            )
+            current_stack_depth[mask_top_left] += 1
+
+            mask_top_right = current_top_rights != 0
+            np.put_along_axis(
+                current_stack,
+                current_stack_depth[:, None],
+                current_top_rights[:, None],
+                axis=-1,
+            )
+            current_stack_depth[mask_top_right] += 1
+
+            mask_bottom_left = current_bottom_lefts != 0
+            np.put_along_axis(
+                current_stack,
+                current_stack_depth[:, None],
+                current_bottom_lefts[:, None],
+                axis=-1,
+            )
+            current_stack_depth[mask_bottom_left] += 1
+
+            mask_bottom_right = current_bottom_rights != 0
+            np.put_along_axis(
+                current_stack,
+                current_stack_depth[:, None],
+                current_bottom_rights[:, None],
+                axis=-1,
+            )
+            current_stack_depth[mask_bottom_right] += 1
+
+            current_firsts_i = current_firsts.copy()
+            while True:
+                mask_running = current_firsts_i < current_ends
+                mask = np.logical_and(mask_running, mask_branch)
+                if np.count_nonzero(mask) == 0:
+                    break
+                step_firsts = current_firsts_i[mask]
+                step_query_positions = np.take_along_axis(
+                    self.positions, step_firsts[:, None], axis=0
+                )
+                step_positions = current_positions[mask]
+                step_overlap = step_query_positions - step_positions
+                step_distances = np.linalg.norm(step_overlap, axis=-1)
+                step_deltas = current_deltas[mask]
+                mask_collision = step_distances < self.separation
+                scale = np.where(
+                    step_distances < 1e-5, np.ones_like(step_distances), step_distances
+                )
+                step_deltas -= np.where(
+                    np.logical_and(step_distances >= 1e-5, mask_collision)[:, None],
+                    step_overlap
+                    / scale[:, None]
+                    * (self.separation - step_distances)[:, None]
+                    / 2,
+                    np.zeros_like(step_overlap),
+                )
+                ix = np.arange(len(self.positions))
+                ix = ix[mask_stack]
+                ix = ix[mask]
+                for i in range(len(ix)):
+                    if mask_collision[i] and step_firsts[i] != ix[i]:
+                        collisions[(ix[i].item(), step_firsts[i].item())] =  step_distances[i].item()
+                    if (
+                        not mask_collision[i]
+                        or step_firsts[i] == ix[i]
+                        or step_distances[i] > 0.016
+                    ):
+                        continue
+                    # print(ix[i], step_firsts[i], step_distances[i], step_deltas[i])
+                step_firsts += 1
+                current_firsts_i[mask] = step_firsts
+                current_deltas[mask] = step_deltas
+
+            current_stack_depth = np.where(mask_branch, current_stack_depth, skip_depth)
+
+            stack_depth[mask_stack] = current_stack_depth
+            stack[mask_stack] = current_stack
+            deltas[mask_stack] = current_deltas
+        for k, v in collisions.items():
+            k_ = (k[1], k[0])
+            if k_ not in collisions:
+                raise RuntimeError(f"{k, v}")
+        return deltas
+
+    def get_gravity(self):
+        pass
+
 
 class Simulation:
 
@@ -405,15 +555,9 @@ class Simulation:
         self.positions = self.positions.astype(np.float32)
         self.prev_positions = np.zeros_like(self.positions)
         for _ in range(substeps):
-            QuadTreeV2(self.positions, separation * 2, pole_distance)
-            quad_tree = QuadTree(
-                (*self.positions.min(0), *self.positions.max(0)),
-                separation * 2,
-                pole_distance,
-            )
-            for i in range(number_of_points):
-                quad_tree.add_point(i, self.positions[i])
-            self.resolve_colisions(quad_tree)
+            quad_tree = QuadTreeV2(self.positions, separation * 2, pole_distance)
+            deltas = quad_tree.get_collisions()
+            self.positions += deltas
         velocity = np.stack([self.positions[:, 1], -self.positions[:, 0]], axis=-1)
         velocity = velocity / np.linalg.norm(velocity, axis=-1, keepdims=True)
         self.prev_positions = self.positions + velocity * dt * initial_spin
@@ -422,28 +566,13 @@ class Simulation:
     def end_frame(self, image_array):
         ffmpeg_writer.add_frame(image_array)
 
-    def resolve_colisions(self, quad_tree):
-        delta = np.zeros_like(self.positions)
-        for i in range(number_of_points):
-            for j in quad_tree.get_colisions(self.positions[i]):
-                if i == j:
-                    continue
-                r = self.positions[j] - self.positions[i]
-                r_len = np.linalg.norm(r)
-                delta[i] -= r / r_len * (2 * separation - r_len) / 2
-        self.positions += delta
-
     def recenter_view(self):
         mean_position = self.positions.mean(0, keepdims=True)
         self.positions -= mean_position
         self.prev_positions -= mean_position
 
     def start_frame(self):
-        quad_tree = QuadTree(
-            (*self.positions.min(0), *self.positions.max(0)),
-            separation * 2,
-            pole_distance,
-        )
+
         for _ in range(substeps):
             quad_tree = QuadTree(
                 (*self.positions.min(0), *self.positions.max(0)),
@@ -459,14 +588,9 @@ class Simulation:
                 2 * self.positions - self.prev_positions + dt**2 * accel,
                 self.positions,
             )
-            quad_tree = QuadTree(
-                (*self.positions.min(0), *self.positions.max(0)),
-                separation * 2,
-                pole_distance,
-            )
-            for i in range(number_of_points):
-                quad_tree.add_point(i, self.positions[i])
-            self.resolve_colisions(quad_tree)
+            quad_tree = QuadTreeV2(self.positions, separation * 2, pole_distance)
+            deltas = quad_tree.get_collisions()
+            self.positions += deltas
 
         e_kin = 0
         for i in range(number_of_points):
