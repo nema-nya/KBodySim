@@ -3,7 +3,7 @@ from ffmpeg_writer import FfmpegWriter
 from wgpu_renderer import WgpuRenderer
 import dataclasses
 
-number_of_points = 25
+number_of_points = 10
 point_resolution = 32
 window_width = 1024
 window_height = 1024
@@ -12,10 +12,12 @@ point_radius = separation
 gravitational_constant = 0.0001
 substeps = 8
 dt = 0.01
-frame_count = 60
+frame_count = 5
 pole_distance = 1
-spawn_radius = 1
+spawn_radius = 0.5
 initial_spin = 0.001
+pows = [2**i for i in range(32)]
+pow_to_p = {p: i for i, p in enumerate(pows)}
 
 
 @dataclasses.dataclass
@@ -202,19 +204,32 @@ class QuadTreeV2:
         stride_y = np.ceil(
             (self.bounding_box[3] - self.bounding_box[1]) / self.separation
         ).astype(np.uint32)
-        stride = max(stride_x, stride_y)
+        stride = max(stride_x, stride_y, 2)
 
         points = np.arange(len(positions))
-        leaves = indicies[:, 0] * stride + indicies[:, 1]
-        ixs = np.argsort(leaves)
-        points = points[ixs]
-        indicies = indicies[ixs]
+        point_buckets = indicies[:, 0] * stride + indicies[:, 1]
+        points_perm = np.argsort(point_buckets)
+        points = points[points_perm]
+        indicies = indicies[points_perm]
+        point_buckets = point_buckets[points_perm]
+
+        mask_not_first = np.zeros(shape=(len(points),), dtype=bool)
+        mask_not_first[1:] = point_buckets[:-1] == point_buckets[1:]
+        mask_first = np.logical_not(mask_not_first)
+        point_firsts = np.argwhere(mask_first).ravel()
+        point_ends = np.ones_like(point_firsts) * len(points)
+        point_ends[:-1] = point_firsts[1:]
 
         p = self._find_power_of_two(stride)
+        assert p > 1
         levels = []
         node_buckets = []
         node_levels = []
-        while p > 1:
+        node_firsts = []
+        node_ends = []
+        tree_depth = 0
+        while p > 0:
+            tree_depth += 1
             buckets = indicies[:, 0] * stride + indicies[:, 1]
             levels.append(buckets)
             indicies = indicies // 2
@@ -222,6 +237,15 @@ class QuadTreeV2:
             node_buckets.append(np.unique_values(buckets))
 
         for i in range(len(levels)):
+            if i == 0:
+                assert len(point_firsts) == len(
+                    node_buckets[0]
+                ), f"{len(point_firsts), len(node_buckets[0])}"
+                node_firsts.append(point_firsts)
+                node_ends.append(point_ends)
+            else:
+                node_firsts.append(np.zeros_like(node_buckets[i]))
+                node_ends.append(np.zeros_like(node_buckets[i]))
             node_levels.append(
                 np.ones(shape=(len(node_buckets[i]),), dtype=np.uint32)
                 * (len(levels) - i - 1)
@@ -229,9 +253,16 @@ class QuadTreeV2:
 
         node_levels = np.concat(node_levels)
         node_buckets = np.concat(node_buckets)
+        node_firsts = np.concat(node_firsts)
+        node_ends = np.concat(node_ends)
+
         node_buckets = node_buckets * len(levels) + node_levels
         node_perm = np.argsort(node_buckets)
+
+        node_levels = node_levels[node_perm]
         node_buckets = node_buckets[node_perm]
+        node_firsts = node_firsts[node_perm]
+        node_ends = node_ends[node_perm]
 
         node_levels = node_buckets % len(levels)
         node_xys = node_buckets // len(levels)
@@ -255,6 +286,84 @@ class QuadTreeV2:
         node_top_rights = node_to_child(1, 0)
         node_bottom_lefts = node_to_child(0, 1)
         node_bottom_rights = node_to_child(1, 1)
+
+        node_bbs = np.zeros(shape=(len(node_buckets), 4))
+        for i in range(4):
+            node_bbs[:, i] = self.bounding_box[[2, 3, 0, 1][i]]
+
+        node_firsts_i = node_firsts.copy()
+        while True:
+            mask_level = node_levels == (tree_depth - 1)
+            mask_running = node_firsts_i != node_ends
+            mask = np.logical_and(mask_level, mask_running)
+            if np.count_nonzero(mask) == 0:
+                break
+            current_firsts = node_firsts_i[mask]
+            current_bbs = node_bbs[mask]
+            current_positions = np.take_along_axis(
+                positions, current_firsts[:, None], axis=0
+            )
+            current_bbs[:, 0] = np.where(
+                current_positions[:, 0] < current_bbs[:, 0],
+                current_positions[:, 0],
+                current_bbs[:, 0],
+            )
+            current_bbs[:, 1] = np.where(
+                current_positions[:, 1] < current_bbs[:, 1],
+                current_positions[:, 1],
+                current_bbs[:, 1],
+            )
+            current_bbs[:, 2] = np.where(
+                current_positions[:, 0] >= current_bbs[:, 2],
+                current_positions[:, 0],
+                current_bbs[:, 2],
+            )
+            current_bbs[:, 3] = np.where(
+                current_positions[:, 1] >= current_bbs[:, 3],
+                current_positions[:, 1],
+                current_bbs[:, 3],
+            )
+            current_firsts += 1
+            node_firsts_i[mask] = current_firsts
+            node_bbs[mask] = current_bbs
+        for i in range(tree_depth - 1):
+            for children in [
+                node_top_lefts,
+                node_top_rights,
+                node_bottom_lefts,
+                node_bottom_rights,
+            ]:
+                mask_level = node_levels == (tree_depth - 2 - i)
+                mask_children = children != 0
+                mask = np.logical_and(mask_level, mask_children)
+                if np.count_nonzero(mask) == 0:
+                    continue
+                current_children = children[mask]
+                current_child_bbs = np.take_along_axis(
+                    node_bbs, current_children[:, None], axis=0
+                )
+                current_bbs = node_bbs[mask]
+                current_bbs[:, 0] = np.where(
+                    current_child_bbs[:, 0] < current_bbs[:, 0],
+                    current_child_bbs[:, 0],
+                    current_bbs[:, 0],
+                )
+                current_bbs[:, 1] = np.where(
+                    current_child_bbs[:, 1] < current_bbs[:, 1],
+                    current_child_bbs[:, 1],
+                    current_bbs[:, 1],
+                )
+                current_bbs[:, 2] = np.where(
+                    current_child_bbs[:, 2] >= current_bbs[:, 2],
+                    current_child_bbs[:, 2],
+                    current_bbs[:, 2],
+                )
+                current_bbs[:, 3] = np.where(
+                    current_child_bbs[:, 3] >= current_bbs[:, 3],
+                    current_child_bbs[:, 3],
+                    current_bbs[:, 3],
+                )
+                node_bbs[mask] = current_bbs
 
 
 class Simulation:
