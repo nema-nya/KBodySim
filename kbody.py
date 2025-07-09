@@ -3,7 +3,7 @@ from ffmpeg_writer import FfmpegWriter
 from wgpu_renderer import WgpuRenderer
 import dataclasses
 
-number_of_points = 25
+number_of_points = 50
 point_resolution = 32
 window_width = 1024
 window_height = 1024
@@ -13,9 +13,9 @@ gravitational_constant = 0.001
 substeps = 8
 dt = 0.001
 frame_count = 900
-pole_distance = 1
-spawn_radius = 0.2
-initial_spin = 0.001
+pole_distance = separation * 5
+spawn_radius = 0.7
+initial_spin = 0.0001
 pows = [2**i for i in range(32)]
 pow_to_p = {p: i for i, p in enumerate(pows)}
 
@@ -521,7 +521,137 @@ class QuadTreeV2:
         return deltas
 
     def get_gravity(self):
-        pass
+        accels = np.zeros_like(self.positions)
+        stack = np.zeros(shape=(len(accels), 4 * self.depth), dtype=np.uint32)
+        stack_depth = np.ones(shape=(len(accels),), dtype=np.uint32)
+        while True:
+            mask_stack = stack_depth != 0
+            if np.count_nonzero(mask_stack) == 0:
+                break
+            current_accels = accels[mask_stack]
+            current_positions = self.positions[mask_stack]
+            current_stack = stack[mask_stack]
+            current_stack_depth = stack_depth[mask_stack]
+            current_stack_depth -= 1
+            current_nodes = np.take_along_axis(
+                current_stack, current_stack_depth[:, None], axis=-1
+            ).ravel()
+            current_bbs = np.take_along_axis(
+                self.node_bbs, current_nodes[:, None], axis=0
+            )
+            current_top_lefts = np.take_along_axis(
+                self.node_top_lefts, current_nodes, axis=0
+            )
+            current_top_rights = np.take_along_axis(
+                self.node_top_rights, current_nodes, axis=0
+            )
+            current_bottom_lefts = np.take_along_axis(
+                self.node_bottom_lefts, current_nodes, axis=0
+            )
+            current_bottom_rights = np.take_along_axis(
+                self.node_bottom_rights, current_nodes, axis=0
+            )
+            current_masses = np.take_along_axis(self.node_masses, current_nodes, axis=0)
+            current_mass_centers = np.take_along_axis(
+                self.node_mass_centers, current_nodes[:, None], axis=0
+            )
+            current_firsts = np.take_along_axis(self.node_firsts, current_nodes, axis=0)
+            current_ends = np.take_along_axis(self.node_ends, current_nodes, axis=0)
+            mask_left = current_bbs[:, 0] < current_positions[:, 0] + self.pole_distance
+            mask_right = (
+                current_bbs[:, 2] >= current_positions[:, 0] - self.pole_distance
+            )
+            mask_bottom = (
+                current_bbs[:, 1] < current_positions[:, 1] + self.pole_distance
+            )
+            mask_top = current_bbs[:, 3] >= current_positions[:, 1] - self.pole_distance
+            mask_branch = np.logical_and(
+                np.logical_and(mask_left, mask_right),
+                np.logical_and(mask_bottom, mask_top),
+            )
+
+            r = current_mass_centers - current_positions
+            r_len = np.linalg.norm(r, axis=-1)
+            mask_gravity = r_len >= self.separation
+            scale = np.where(r_len < 1e-5, np.ones_like(r_len), r_len)
+            skip_accels = current_accels.copy()
+            skip_accels += np.where(
+                mask_gravity[:, None],
+                r
+                / scale[:, None] ** 3
+                * gravitational_constant
+                * current_masses[:, None],
+                np.zeros_like(current_accels),
+            )
+            skip_depth = current_stack_depth.copy()
+            mask_top_left = current_top_lefts != 0
+            np.put_along_axis(
+                current_stack,
+                current_stack_depth[:, None],
+                current_top_lefts[:, None],
+                axis=-1,
+            )
+            current_stack_depth[mask_top_left] += 1
+
+            mask_top_right = current_top_rights != 0
+            np.put_along_axis(
+                current_stack,
+                current_stack_depth[:, None],
+                current_top_rights[:, None],
+                axis=-1,
+            )
+            current_stack_depth[mask_top_right] += 1
+
+            mask_bottom_left = current_bottom_lefts != 0
+            np.put_along_axis(
+                current_stack,
+                current_stack_depth[:, None],
+                current_bottom_lefts[:, None],
+                axis=-1,
+            )
+            current_stack_depth[mask_bottom_left] += 1
+
+            mask_bottom_right = current_bottom_rights != 0
+            np.put_along_axis(
+                current_stack,
+                current_stack_depth[:, None],
+                current_bottom_rights[:, None],
+                axis=-1,
+            )
+            current_stack_depth[mask_bottom_right] += 1
+
+            current_firsts_i = current_firsts.copy()
+            while True:
+                mask_running = current_firsts_i < current_ends
+                mask = np.logical_and(mask_running, mask_branch)
+                if np.count_nonzero(mask) == 0:
+                    break
+                step_firsts = current_firsts_i[mask]
+                step_query_positions = np.take_along_axis(
+                    self.positions, step_firsts[:, None], axis=0
+                )
+                step_positions = current_positions[mask]
+                r = step_query_positions - step_positions
+                r_len = np.linalg.norm(r, axis=-1)
+                step_accels = current_accels[mask]
+                mask_gravity = r_len > self.separation
+                scale = np.where(r_len <= self.separation, np.ones_like(r_len), r_len)
+                step_accels += np.where(
+                    mask_gravity[:, None],
+                    r / scale[:, None] ** 3 * gravitational_constant,
+                    np.zeros_like(step_accels),
+                )
+                step_firsts += 1
+                current_firsts_i[mask] = step_firsts
+                current_accels[mask] = step_accels
+
+            current_stack_depth = np.where(mask_branch, current_stack_depth, skip_depth)
+            current_accels = np.where(mask_branch[:, None], current_accels, skip_accels)
+
+            stack_depth[mask_stack] = current_stack_depth
+            stack[mask_stack] = current_stack
+            accels[mask_stack] = current_accels
+        return accels
 
 
 class Simulation:
@@ -553,18 +683,10 @@ class Simulation:
 
     def start_frame(self):
         for _ in range(substeps):
-            quad_tree = QuadTree(
-                (*self.positions.min(0), *self.positions.max(0)),
-                separation * 2,
-                pole_distance,
-            )
-            for i in range(number_of_points):
-                quad_tree.add_point(i, self.positions[i])
-            accel = np.zeros(shape=(number_of_points, 2), dtype=np.float32)
-            for i in range(number_of_points):
-                accel[i] = quad_tree.get_gravity(self.positions[i])
+            quad_tree = QuadTreeV2(self.positions, separation * 2, pole_distance)
+            accels = quad_tree.get_gravity()
             self.positions, self.prev_positions = (
-                2 * self.positions - self.prev_positions + dt**2 * accel,
+                2 * self.positions - self.prev_positions + dt**2 * accels,
                 self.positions,
             )
             quad_tree = QuadTreeV2(self.positions, separation * 2, pole_distance)
