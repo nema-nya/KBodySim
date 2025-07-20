@@ -7,38 +7,36 @@ from quad_tree_v2 import QuadTreeV2
 class Simulation:
 
     def __init__(self):
-        self.number_of_points = 5
-        self.point_resolution = 128
+        self.number_of_points = 100
+        self.point_resolution = 32
         self.window_width = 1024
         self.window_height = 1024
         self.separation = 0.01
         self.point_radius = self.separation
         self.gravitational_constant = 0.001
-        self.substeps = 8
-        self.dt = 0.001
-        self.frame_count = 900
+        self.substeps = 32
+        self.dt = 0.01
+        self.frame_count = 1200
         self.pole_distance = self.separation * 5
-        self.spawn_radius = 0.2
-        self.initial_spin = 0.003
-        self.positions = (
-            (np.random.rand(self.number_of_points, 2) * 2 - 1)
-            * (1 - self.separation)
-            * self.spawn_radius
-        )
+        self.spawn_radius = 0.3
+        self.initial_spin = 0.3
+
+        angles = np.random.rand(self.number_of_points) * 2 * np.pi
+        radii = np.sqrt(np.random.rand(self.number_of_points)) * self.spawn_radius
+        self.positions = np.stack([np.cos(angles), np.sin(angles)], axis=-1) * radii[:,None]
         self.positions = self.positions.astype(np.float32)
         self.colors = np.ones(shape=(self.number_of_points, 4), dtype=np.float32)
         self.prev_positions = np.zeros_like(self.positions)
-        for _ in range(self.substeps):
-            quad_tree = QuadTreeV2(
-                self.positions,
-                self.separation * 2,
-                self.pole_distance,
-                self.gravitational_constant,
-            )
-            deltas = quad_tree.get_collisions()
-            self.positions += deltas
+        # for _ in range(self.substeps):
+        #     quad_tree = QuadTreeV2(
+        #         self.positions,
+        #         self.separation * 2,
+        #         self.pole_distance,
+        #         self.gravitational_constant,
+        #     )
+        #     deltas = quad_tree.get_collisions()
+        #     self.positions += deltas
         velocity = np.stack([self.positions[:, 1], -self.positions[:, 0]], axis=-1)
-        velocity = velocity / np.linalg.norm(velocity, axis=-1, keepdims=True)
         self.prev_positions = self.positions + velocity * self.dt * self.initial_spin
         self.frame_count = self.frame_count
 
