@@ -3,42 +3,44 @@ from ffmpeg_writer import FfmpegWriter
 from wgpu_renderer import WgpuRenderer
 from quad_tree_v2 import QuadTreeV2
 
-number_of_points = 5
-point_resolution = 32
-window_width = 1024
-window_height = 1024
-separation = 0.01
-point_radius = separation
-gravitational_constant = 0.001
-substeps = 8
-dt = 0.001
-frame_count = 900
-pole_distance = separation * 5
-spawn_radius = 0.2
-initial_spin = 0.003
-pows = [2**i for i in range(32)]
-pow_to_p = {p: i for i, p in enumerate(pows)}
-
 
 class Simulation:
 
     def __init__(self):
+        self.number_of_points = 5
+        self.point_resolution = 128
+        self.window_width = 1024
+        self.window_height = 1024
+        self.separation = 0.01
+        self.point_radius = self.separation
+        self.gravitational_constant = 0.001
+        self.substeps = 8
+        self.dt = 0.001
+        self.frame_count = 900
+        self.pole_distance = self.separation * 5
+        self.spawn_radius = 0.2
+        self.initial_spin = 0.003
         self.positions = (
-            (np.random.rand(number_of_points, 2) * 2 - 1)
-            * (1 - separation)
-            * spawn_radius
+            (np.random.rand(self.number_of_points, 2) * 2 - 1)
+            * (1 - self.separation)
+            * self.spawn_radius
         )
         self.positions = self.positions.astype(np.float32)
-        self.colors = np.ones(shape=(number_of_points, 4), dtype=np.float32)
+        self.colors = np.ones(shape=(self.number_of_points, 4), dtype=np.float32)
         self.prev_positions = np.zeros_like(self.positions)
-        for _ in range(substeps):
-            quad_tree = QuadTreeV2(self.positions, separation * 2, pole_distance, gravitational_constant)
+        for _ in range(self.substeps):
+            quad_tree = QuadTreeV2(
+                self.positions,
+                self.separation * 2,
+                self.pole_distance,
+                self.gravitational_constant,
+            )
             deltas = quad_tree.get_collisions()
             self.positions += deltas
         velocity = np.stack([self.positions[:, 1], -self.positions[:, 0]], axis=-1)
         velocity = velocity / np.linalg.norm(velocity, axis=-1, keepdims=True)
-        self.prev_positions = self.positions + velocity * dt * initial_spin
-        self.frame_count = frame_count
+        self.prev_positions = self.positions + velocity * self.dt * self.initial_spin
+        self.frame_count = self.frame_count
 
     def end_frame(self, image_array):
         ffmpeg_writer.add_frame(image_array)
@@ -49,49 +51,63 @@ class Simulation:
         self.prev_positions -= mean_position
 
     def start_frame(self):
-        for _ in range(substeps):
-            quad_tree = QuadTreeV2(self.positions, separation * 2, pole_distance, gravitational_constant)
-            accels = quad_tree.get_gravity()
-            self.positions, self.prev_positions = (
-                2 * self.positions - self.prev_positions + dt**2 * accels,
-                self.positions,
-            )
-            quad_tree = QuadTreeV2(self.positions, separation * 2, pole_distance, gravitational_constant)
-            deltas = quad_tree.get_collisions()
-            self.positions += deltas
+        # for _ in range(self.substeps):
+        #     quad_tree = QuadTreeV2(
+        #         self.positions,
+        #         self.separation * 2,
+        #         self.pole_distance,
+        #         self.gravitational_constant,
+        #     )
+        #     accels = quad_tree.get_gravity()
+        #     self.positions, self.prev_positions = (
+        #         2 * self.positions - self.prev_positions + self.dt**2 * accels,
+        #         self.positions,
+        #     )
+        #     quad_tree = QuadTreeV2(
+        #         self.positions,
+        #         self.separation * 2,
+        #         self.pole_distance,
+        #         self.gravitational_constant,
+        #     )
+        #     deltas = quad_tree.get_collisions()
+        #     self.positions += deltas
 
-        e_kin = 0
-        for i in range(number_of_points):
-            e_kin += (
-                np.linalg.norm(self.positions[i] - self.prev_positions[i]) / dt
-            ) ** 2 / 2
+        # e_kin = 0
+        # for i in range(self.number_of_points):
+        #     e_kin += (
+        #         np.linalg.norm(self.positions[i] - self.prev_positions[i]) / self.dt
+        #     ) ** 2 / 2
 
-        scale = 100
-        intensity = np.exp(
-            -scale * (((self.positions - self.prev_positions) / dt) ** 2).sum(-1) / 2
-        )
-        direction = self.positions - self.prev_positions
-        direction = direction / np.linalg.norm(direction, axis=-1, keepdims=True)
-        self.colors[:, :2] = (1 - intensity[:, None]) * (
-            direction / 2 + 1 / 2
-        ) + intensity[:, None] * np.array([1.0, 1.0])[None, :]
+        # scale = 100
+        # intensity = np.exp(
+        #     -scale
+        #     * (((self.positions - self.prev_positions) / self.dt) ** 2).sum(-1)
+        #     / 2
+        # )
+        # direction = self.positions - self.prev_positions
+        # direction = direction / np.linalg.norm(direction, axis=-1, keepdims=True)
+        # self.colors[:, :2] = (1 - intensity[:, None]) * (
+        #     direction / 2 + 1 / 2
+        # ) + intensity[:, None] * np.array([1.0, 1.0])[None, :]
 
         self.recenter_view()
         if self.frame_count > 0:
             self.frame_count -= 1
-            return self.positions, self.colors
+            return self.positions, self.prev_positions, self.colors
         ffmpeg_writer.finish()
         return None
 
 
 if __name__ == "__main__":
     simulation = Simulation()
-    ffmpeg_writer = FfmpegWriter("out.webm", window_width, window_height)
+    ffmpeg_writer = FfmpegWriter(
+        "out.webm", simulation.window_width, simulation.window_height
+    )
     wgpu_renderer = WgpuRenderer(
-        window_width,
-        window_height,
+        simulation.window_width,
+        simulation.window_height,
         simulation,
-        point_resolution,
-        point_radius,
-        number_of_points,
+        simulation.point_resolution,
+        simulation.point_radius,
+        simulation.number_of_points,
     )

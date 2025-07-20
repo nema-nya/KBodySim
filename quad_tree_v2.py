@@ -1,5 +1,6 @@
 import numpy as np
 
+
 class QuadTreeV2:
     def _find_power_of_two(self, n):
         n -= 1
