@@ -4,17 +4,23 @@ import numpy as np
 
 compute_shader_source = """
     @group(0) @binding(0) var<storage, read>  positions: array<vec2<f32>>;
-    @group(0) @binding(1) var<storage, read_write> verticies: array<vec2<f32>>;
+    @group(0) @binding(1) var<storage, read>  colors: array<vec4<f32>>;
+    @group(0) @binding(2) var<storage, read_write> vertex_positions: array<vec2<f32>>;
+    @group(0) @binding(3) var<storage, read_write> vertex_colors: array<vec4<f32>>;
     override point_resolution: u32;
     override point_radius: f32;
     @compute @workgroup_size(1, 1, 1) fn generate_verticies(@builtin(global_invocation_id) id: vec3<u32>) {
         let i = id.x;
         let pi = acos(-1.0);
         let pos = positions[i];
+        let col = colors[i];
         for (var j = 0u; j < point_resolution; j++) {
-            verticies[i * point_resolution * 3u + j * 3u + 0u] = pos;
-            verticies[i * point_resolution * 3u + j * 3u + 1u] = pos + vec2<f32>(cos(f32(j) / f32(point_resolution) * 2 * pi), sin(f32(j) / f32(point_resolution) * 2 * pi)) * point_radius;
-            verticies[i * point_resolution * 3u + j * 3u + 2u] = pos + vec2<f32>(cos(f32(j + 1u) / f32(point_resolution) * 2 * pi), sin(f32(j + 1u) / f32(point_resolution) * 2 * pi)) * point_radius;
+            vertex_positions[i * point_resolution * 3u + j * 3u + 0u] = pos;
+            vertex_positions[i * point_resolution * 3u + j * 3u + 1u] = pos + vec2<f32>(cos(f32(j) / f32(point_resolution) * 2 * pi), sin(f32(j) / f32(point_resolution) * 2 * pi)) * point_radius;
+            vertex_positions[i * point_resolution * 3u + j * 3u + 2u] = pos + vec2<f32>(cos(f32(j + 1u) / f32(point_resolution) * 2 * pi), sin(f32(j + 1u) / f32(point_resolution) * 2 * pi)) * point_radius;
+            vertex_colors[i * point_resolution * 3u + j * 3u + 0u] = col;
+            vertex_colors[i * point_resolution * 3u + j * 3u + 1u] = col;
+            vertex_colors[i * point_resolution * 3u + j * 3u + 2u] = col;
         }
     }
 """
@@ -22,6 +28,7 @@ compute_shader_source = """
 shader_source = """
     struct VertexInput {
         @location(0) pos : vec2<f32>,
+        @location(1) color : vec4<f32>,
         @builtin(vertex_index) vertex_index : u32,
     };
     struct VertexOutput {
@@ -34,7 +41,7 @@ shader_source = """
         let index = i32(in.vertex_index);
         var out: VertexOutput;
         out.pos = vec4<f32>(in.pos, 0.0, 1.0);
-        out.color = vec4<f32>(1.0, 1.0, 1.0, 1.0);
+        out.color = in.color;
         return out;
     }
 
@@ -91,20 +98,42 @@ class WgpuRenderer:
         )
         self.render_pipeline = self.device.create_render_pipeline(**pipeline_kwargs)
 
-        self.positions_buffer = self.device.create_buffer(
+        self.position_buffer = self.device.create_buffer(
             size=self.number_of_points * 2 * 4,
             usage=wgpu.BufferUsage.COPY_DST + wgpu.BufferUsage.STORAGE,
         )
-        self.positions_buffer_staging = self.device.create_buffer(
+
+        self.color_buffer = self.device.create_buffer(
+            size=self.number_of_points * 4 * 4,
+            usage=wgpu.BufferUsage.COPY_DST + wgpu.BufferUsage.STORAGE,
+        )
+
+        self.position_buffer_staging = self.device.create_buffer(
             size=self.number_of_points * 2 * 4,
             usage=wgpu.BufferUsage.MAP_WRITE + wgpu.BufferUsage.COPY_SRC,
         )
 
-        self.vertex_buffer = self.device.create_buffer(
+        self.color_buffer_staging = self.device.create_buffer(
+            size=self.number_of_points * 4 * 4,
+            usage=wgpu.BufferUsage.MAP_WRITE + wgpu.BufferUsage.COPY_SRC,
+        )
+
+        self.vertex_color_buffer_staging = self.device.create_buffer(
+            size=self.number_of_points * self.point_resolution * 3 * 4 * 4,
+            usage=wgpu.BufferUsage.COPY_SRC + wgpu.BufferUsage.STORAGE,
+        )
+
+        self.vertex_position_buffer = self.device.create_buffer(
             size=self.number_of_points * self.point_resolution * 3 * 2 * 4,
             usage=wgpu.BufferUsage.COPY_DST + wgpu.BufferUsage.VERTEX,
         )
-        self.vertex_buffer_staging = self.device.create_buffer(
+
+        self.vertex_color_buffer = self.device.create_buffer(
+            size=self.number_of_points * self.point_resolution * 3 * 4 * 4,
+            usage=wgpu.BufferUsage.COPY_DST + wgpu.BufferUsage.VERTEX,
+        )
+
+        self.vertex_position_buffer_staging = self.device.create_buffer(
             size=self.number_of_points * self.point_resolution * 3 * 2 * 4,
             usage=wgpu.BufferUsage.COPY_SRC + wgpu.BufferUsage.STORAGE,
         )
@@ -171,7 +200,18 @@ class WgpuRenderer:
                             }
                         ],
                         "step_mode": wgpu.VertexStepMode.vertex,
-                    }
+                    },
+                    {
+                        "array_stride": 4 * 4,
+                        "attributes": [
+                            {
+                                "format": wgpu.VertexFormat.float32x4,
+                                "offset": 0,
+                                "shader_location": 1,
+                            }
+                        ],
+                        "step_mode": wgpu.VertexStepMode.vertex,
+                    },
                 ],
                 "module": shader,
                 "entry_point": "vs_main",
@@ -204,32 +244,52 @@ class WgpuRenderer:
 
     def get_draw_function(self):
         def draw_frame():
-            positions = self.simulation.start_frame()
-            if positions is None:
+            positions_colors = self.simulation.start_frame()
+            if positions_colors is None:
                 self.canvas.close()
                 return
+            positions, colors = positions_colors
 
             current_texture = self.context.get_current_texture()
 
             command_encoder = self.device.create_command_encoder()
 
-            self.positions_buffer_staging.map_sync(wgpu.MapMode.WRITE)
-            self.positions_buffer_staging.write_mapped(positions)
-            self.positions_buffer_staging.unmap()
+            self.position_buffer_staging.map_sync(wgpu.MapMode.WRITE)
+            self.color_buffer_staging.map_sync(wgpu.MapMode.WRITE)
+            self.position_buffer_staging.write_mapped(positions)
+            self.color_buffer_staging.write_mapped(colors)
+            self.position_buffer_staging.unmap()
+            self.color_buffer_staging.unmap()
 
             command_encoder.copy_buffer_to_buffer(
-                source=self.positions_buffer_staging,
+                source=self.position_buffer_staging,
                 source_offset=0,
-                destination=self.positions_buffer,
+                destination=self.position_buffer,
                 destination_offset=0,
                 size=self.number_of_points * 2 * 4,
+            )
+
+            command_encoder.copy_buffer_to_buffer(
+                source=self.color_buffer_staging,
+                source_offset=0,
+                destination=self.color_buffer,
+                destination_offset=0,
+                size=self.number_of_points * 4 * 4,
             )
 
             bind_group = self.device.create_bind_group(
                 layout=self.compute_pipeline.get_bind_group_layout(0),
                 entries=[
-                    {"binding": 0, "resource": {"buffer": self.positions_buffer}},
-                    {"binding": 1, "resource": {"buffer": self.vertex_buffer_staging}},
+                    {"binding": 0, "resource": {"buffer": self.position_buffer}},
+                    {"binding": 1, "resource": {"buffer": self.color_buffer}},
+                    {
+                        "binding": 2,
+                        "resource": {"buffer": self.vertex_position_buffer_staging},
+                    },
+                    {
+                        "binding": 3,
+                        "resource": {"buffer": self.vertex_color_buffer_staging},
+                    },
                 ],
             )
 
@@ -240,11 +300,19 @@ class WgpuRenderer:
             compute_pass.end()
 
             command_encoder.copy_buffer_to_buffer(
-                source=self.vertex_buffer_staging,
+                source=self.vertex_position_buffer_staging,
                 source_offset=0,
-                destination=self.vertex_buffer,
+                destination=self.vertex_position_buffer,
                 destination_offset=0,
                 size=self.number_of_points * self.point_resolution * 3 * 2 * 4,
+            )
+
+            command_encoder.copy_buffer_to_buffer(
+                source=self.vertex_color_buffer_staging,
+                source_offset=0,
+                destination=self.vertex_color_buffer,
+                destination_offset=0,
+                size=self.number_of_points * self.point_resolution * 3 * 4 * 4,
             )
 
             render_pass = command_encoder.begin_render_pass(
@@ -267,7 +335,10 @@ class WgpuRenderer:
             )
             render_pass.set_pipeline(self.render_pipeline)
             render_pass.set_vertex_buffer(
-                slot=0, buffer=self.vertex_buffer, offset=0, size=None
+                slot=0, buffer=self.vertex_position_buffer, offset=0, size=None
+            )
+            render_pass.set_vertex_buffer(
+                slot=1, buffer=self.vertex_color_buffer, offset=0, size=None
             )
             render_pass.draw(self.number_of_points * self.point_resolution * 3, 1, 0, 0)
             render_pass.end()
