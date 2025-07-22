@@ -7,7 +7,7 @@ from quad_tree_v2 import QuadTreeV2
 class Simulation:
 
     def __init__(self):
-        self.number_of_points = 1000
+        self.number_of_points = 100
         self.point_resolution = 32
         self.window_width = 1024
         self.window_height = 1024
@@ -18,8 +18,9 @@ class Simulation:
         self.dt = 1e-4
         self.frame_count = 900
         self.pole_distance = self.separation * 5
-        self.spawn_radius = 1
+        self.spawn_radius = 0.5
         self.initial_spin = 0.4
+        self.init_substeps = 32
         self.ffmpeg_writer = FfmpegWriter(
             "out.webm", self.window_width, self.window_height
         )

@@ -3,6 +3,414 @@ from wgpu.gui.auto import WgpuCanvas, run
 import numpy as np
 
 
+class ComputePointTilePhase:
+    shader_source = """
+        struct Uniforms {
+            tree_bb_min: vec2<f32>,
+            tree_bb_max: vec2<f32>,
+            separation: f32,
+        };
+        
+        @group(0) @binding(0) var<storage, read> positions: array<vec2<f32>>;
+        @group(0) @binding(1) var<storage, read_write> tiles: array<u32>;
+        @group(0) @binding(2) var<uniform> uniforms: Uniforms;
+
+        fn point_to_tile(point: vec2<f32>) -> u32 {
+            let tile_x = u32(point.x / uniforms.separation); 
+            let tile_y = u32(point.y / uniforms.separation);
+            let max_tile_y = u32((uniforms.tree_bb_max.y - uniforms.tree_bb_min.y) / uniforms.separation);
+            return tile_x * max_tile_y + tile_y;
+        }
+
+        @compute @workgroup_size(1, 1, 1) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+            let i = id.x;
+            let p = positions[i];
+            tiles[i] = point_to_tile(p);
+        }
+
+    """
+
+    def __init__(self, device, number_of_points):
+        self.number_of_points = number_of_points
+        self.uniform_values = np.zeros(shape=(1,), dtype=np.dtype("2f4,2f4,f4,4V"))
+
+        self.uniform_buffer = device.create_buffer(
+            size=self.uniform_values.nbytes,
+            usage=wgpu.BufferUsage.UNIFORM + wgpu.BufferUsage.COPY_DST,
+        )
+
+        self.uniform_buffer_staging = device.create_buffer(
+            size=self.uniform_values.nbytes,
+            usage=wgpu.BufferUsage.COPY_SRC + wgpu.BufferUsage.MAP_WRITE,
+        )
+
+        self.tiles_buffer = device.create_buffer(
+            size=number_of_points * 2 * 4,
+            usage=wgpu.BufferUsage.STORAGE,
+        )
+
+        pipeline_kwargs = self.get_pipeline_kwargs(device)
+        self.pipeline = device.create_compute_pipeline(**pipeline_kwargs)
+
+    def get_pipeline_kwargs(self, device):
+        shader = device.create_shader_module(code=self.shader_source)
+        return dict(
+            layout=wgpu.enums.AutoLayoutMode.auto,
+            compute={
+                "module": shader,
+                "entry_point": "main",
+            },
+        )
+
+    def compute_pass(
+        self,
+        device,
+        positions_buffer,
+        command_encoder,
+        separation,
+    ):
+        bind_group = device.create_bind_group(
+            layout=self.pipeline.get_bind_group_layout(0),
+            entries=[
+                {"binding": 0, "resource": {"buffer": positions_buffer}},
+                {"binding": 1, "resource": {"buffer": self.tiles_buffer}},
+                {"binding": 2, "resource": {"buffer": self.uniform_buffer}},
+            ],
+        )
+
+        self.uniform_values[0][0][0] = -2.0
+        self.uniform_values[0][0][1] = -2.0
+        self.uniform_values[0][1][0] = 2.0
+        self.uniform_values[0][1][1] = 2.0
+        self.uniform_values[0][2] = separation
+
+        self.uniform_buffer_staging.map_sync(wgpu.MapMode.WRITE)
+        self.uniform_buffer_staging.write_mapped(self.uniform_values)
+        self.uniform_buffer_staging.unmap()
+
+        command_encoder.copy_buffer_to_buffer(
+            source=self.uniform_buffer_staging,
+            source_offset=0,
+            destination=self.uniform_buffer,
+            destination_offset=0,
+            size=self.uniform_values.nbytes,
+        )
+
+        compute_pass = command_encoder.begin_compute_pass()
+        compute_pass.set_pipeline(self.pipeline)
+        compute_pass.set_bind_group(0, bind_group)
+        compute_pass.dispatch_workgroups(self.number_of_points)
+        compute_pass.end()
+
+
+class TileSortPhase:
+    tile_sort_shader_source = """
+        struct TileSortUniform {
+            tree_bb_min: vec2<f32>,
+            tree_bb_max: vec2<f32>,
+            separation: f32,
+            number_of_bodies: u32,
+            k: u32,
+            j: u32,
+        };
+        
+        @group(0) @binding(0) var<storage, read_write> positions: array<vec2<f32>>;
+        @group(0) @binding(1) var<storage, read_write> prev_positions: array<vec2<f32>>;
+        @group(0) @binding(2) var<storage, read_write> tiles: array<u32>;
+        @group(0) @binding(3) var<uniform> tile_sort_uniform: TileSortUniform;
+
+        fn compare(left: u32, right: u32) -> bool {
+            return tiles[left] < tiles[right];
+        }
+
+        @compute @workgroup_size(1, 1, 1) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+            let i = id.x;
+            let p = positions[i];
+            let l = i ^ tile_sort_uniform.j;
+            if l >= tile_sort_uniform.number_of_bodies {
+                return;
+            }
+            if l > i {
+                if ( ((i & tile_sort_uniform.k) == 0) && (compare(l, i))) || ( ((i & tile_sort_uniform.k) != 0) && (compare(i, l))) {
+                    let temp_i = positions[i];
+                    let temp_prev_i = prev_positions[i];
+                    let temp_tile_i = tiles[i];
+                    positions[i] = positions[l];
+                    prev_positions[i] = prev_positions[l];
+                    tiles[i] = tiles[l];
+                    positions[l] = temp_i;
+                    prev_positions[l] = temp_prev_i;
+                    tiles[l] = temp_tile_i; 
+                }
+            }
+        }
+
+    """
+
+    def __init__(self, device):
+        self.tile_sort_uniform_values = np.zeros(
+            shape=(1,), dtype=np.dtype("2f4,2f4,f4,u4,u4,u4")
+        )
+        self.tile_sort_uniform_buffer = device.create_buffer(
+            size=self.tile_sort_uniform_values.nbytes,
+            usage=wgpu.BufferUsage.UNIFORM + wgpu.BufferUsage.COPY_DST,
+        )
+
+        self.tile_sort_uniform_buffer_staging = device.create_buffer(
+            size=self.tile_sort_uniform_values.nbytes,
+            usage=wgpu.BufferUsage.COPY_SRC + wgpu.BufferUsage.MAP_WRITE,
+        )
+
+        pipeline_kwargs = self.get_pipeline_kwargs(device)
+        self.pipeline = device.create_compute_pipeline(**pipeline_kwargs)
+
+    def get_pipeline_kwargs(self, device):
+        shader = device.create_shader_module(code=self.tile_sort_shader_source)
+        return dict(
+            layout=wgpu.enums.AutoLayoutMode.auto,
+            compute={
+                "module": shader,
+                "entry_point": "main",
+            },
+        )
+
+    def compute_pass(
+        self,
+        device,
+        positions_buffer,
+        prev_positions_buffer,
+        tiles_buffer,
+        command_encoder,
+        number_of_bodies,
+        separation,
+        k,
+        j,
+    ):
+        bind_group = device.create_bind_group(
+            layout=self.pipeline.get_bind_group_layout(0),
+            entries=[
+                {"binding": 0, "resource": {"buffer": positions_buffer}},
+                {"binding": 1, "resource": {"buffer": prev_positions_buffer}},
+                {"binding": 2, "resource": {"buffer": tiles_buffer}},
+                {"binding": 3, "resource": {"buffer": self.tile_sort_uniform_buffer}},
+            ],
+        )
+
+        self.tile_sort_uniform_values[0][0][0] = -2.0
+        self.tile_sort_uniform_values[0][0][1] = -2.0
+        self.tile_sort_uniform_values[0][1][0] = 2.0
+        self.tile_sort_uniform_values[0][1][1] = 2.0
+        self.tile_sort_uniform_values[0][2] = separation
+        self.tile_sort_uniform_values[0][3] = number_of_bodies
+        self.tile_sort_uniform_values[0][4] = k
+        self.tile_sort_uniform_values[0][5] = j
+
+        self.tile_sort_uniform_buffer_staging.map_sync(wgpu.MapMode.WRITE)
+        self.tile_sort_uniform_buffer_staging.write_mapped(
+            self.tile_sort_uniform_values
+        )
+        self.tile_sort_uniform_buffer_staging.unmap()
+
+        command_encoder.copy_buffer_to_buffer(
+            source=self.tile_sort_uniform_buffer_staging,
+            source_offset=0,
+            destination=self.tile_sort_uniform_buffer,
+            destination_offset=0,
+            size=self.tile_sort_uniform_values.nbytes,
+        )
+
+        compute_pass = command_encoder.begin_compute_pass()
+        compute_pass.set_pipeline(self.pipeline)
+        compute_pass.set_bind_group(0, bind_group)
+        compute_pass.dispatch_workgroups(number_of_bodies)
+        compute_pass.end()
+
+
+class ComputeQuadTreePhase:
+    shader_source = """
+        struct Node {
+            bb_min: vec2<f32>,
+            bb_max: vec2<f32>,
+            mass_center: vec2<f32>,
+            mass: f32,
+            first_child: u32,
+            child_count: u32,
+            top_left: u32,
+            top_right: u32,
+            bottom_left: u32,
+            bottom_right: u32,
+            lock: atomic<u32>,
+        };
+
+        struct Uniforms {
+            tree_bb_min: vec2<f32>,
+            tree_bb_max: vec2<f32>,
+            separation: f32,
+            number_of_bodies: u32,
+        };
+
+        struct NodeQueue {
+            lock: atomic<u32>,
+            count: u32,
+        }
+
+        @group(0) @binding(0) var<storage, read_write> nodes: array<Node>;
+        @group(0) @binding(1) var<storage, read_write> node_queue: NodeQueue;
+        @group(0) @binding(2) var<storage, read> tiles: array<u32>;
+        @group(0) @binding(3) var<storage, read> positions: array<vec2<f32>>;
+        @group(0) @binding(4) var<uniform> uniforms: Uniforms;
+        
+        fn lock_node(n: u32) {
+            while atomicExchange(&nodes[n].lock, 1u) == 1u {};
+        }
+        
+        fn unlock_node(n: u32) {
+            atomicStore(&nodes[n].lock, 0u);
+        }
+
+        fn lock_root() {
+            while atomicExchange(&node_queue.lock, 1u) == 1u {};
+            if node_queue.count == 0 {
+                node_queue.count = 1;
+                nodes[0].bb_min = uniforms.tree_bb_min;
+                nodes[0].bb_max = uniforms.tree_bb_max;
+                nodes[0].mass_center = vec2<f32>(0.0, 0.0);
+                nodes[0].mass = 0.0;
+                nodes[0].first_child = 0u;
+                nodes[0].child_count = 0u;
+                nodes[0].top_left = 0u;
+                nodes[0].top_right = 0u;
+                nodes[0].bottom_left = 0u;
+                nodes[0].bottom_right = 0u;
+                atomicStore(&nodes[0].lock, 1u);
+                atomicStore(&node_queue.lock, 0u);
+            } else {
+                atomicStore(&node_queue.lock, 0u);
+                lock_node(0u);
+            }
+        }
+
+        
+
+
+        @compute @workgroup_size(1, 1, 1) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+            let i = id.x;
+            let p = positions[i];
+            nodes[i].top_left = 0u;
+            node_queue.count = tiles[i] + uniforms.number_of_bodies;
+            nodes[i].mass = positions[i].x;
+            lock_root();
+            unlock_node(0u);
+        }
+
+    """
+
+    def __init__(self, device, number_of_bodies):
+        self.number_of_bodies = number_of_bodies
+
+        self.uniform_values = np.zeros(shape=(1,), dtype=np.dtype("2f4,2f4,f4,u4,8V"))
+
+        self.node_values = np.zeros(
+            shape=(1,), dtype=np.dtype("2f4,2f4,f4,u4,u4,u4,u4,u4,u4,u4")
+        )
+
+        self.nodes_buffer = device.create_buffer(
+            size=self.number_of_bodies * self.node_values.nbytes * 8,
+            usage=wgpu.BufferUsage.STORAGE,
+        )
+
+        self.node_queue_buffer = device.create_buffer(
+            size=32,
+            usage=wgpu.BufferUsage.STORAGE + wgpu.BufferUsage.COPY_DST,
+        )
+
+        self.node_queue_buffer_staging = device.create_buffer(
+            size=32,
+            usage=wgpu.BufferUsage.COPY_SRC + wgpu.BufferUsage.MAP_WRITE,
+        )
+
+        self.uniform_buffer = device.create_buffer(
+            size=self.uniform_values.nbytes,
+            usage=wgpu.BufferUsage.UNIFORM + wgpu.BufferUsage.COPY_DST,
+        )
+
+        self.uniform_buffer_staging = device.create_buffer(
+            size=self.uniform_values.nbytes,
+            usage=wgpu.BufferUsage.COPY_SRC + wgpu.BufferUsage.MAP_WRITE,
+        )
+
+        pipeline_kwargs = self.get_pipeline_kwargs(device)
+        self.pipeline = device.create_compute_pipeline(**pipeline_kwargs)
+
+    def get_pipeline_kwargs(self, device):
+        shader = device.create_shader_module(code=self.shader_source)
+        return dict(
+            layout=wgpu.enums.AutoLayoutMode.auto,
+            compute={
+                "module": shader,
+                "entry_point": "main",
+            },
+        )
+
+    def compute_pass(
+        self,
+        device,
+        positions_buffer,
+        tiles_buffer,
+        command_encoder,
+        number_of_bodies,
+        separation,
+    ):
+        bind_group = device.create_bind_group(
+            layout=self.pipeline.get_bind_group_layout(0),
+            entries=[
+                {"binding": 0, "resource": {"buffer": self.nodes_buffer}},
+                {"binding": 1, "resource": {"buffer": self.node_queue_buffer}},
+                {"binding": 2, "resource": {"buffer": tiles_buffer}},
+                {"binding": 3, "resource": {"buffer": positions_buffer}},
+                {"binding": 4, "resource": {"buffer": self.uniform_buffer}},
+            ],
+        )
+
+        self.uniform_values[0][0][0] = -2.0
+        self.uniform_values[0][0][1] = -2.0
+        self.uniform_values[0][1][0] = 2.0
+        self.uniform_values[0][1][1] = 2.0
+        self.uniform_values[0][2] = separation
+        self.uniform_values[0][3] = number_of_bodies
+
+        node_queue_values = np.zeros(shape=(8,), dtype=np.uint32)
+
+        self.uniform_buffer_staging.map_sync(wgpu.MapMode.WRITE)
+        self.node_queue_buffer_staging.map_sync(wgpu.MapMode.WRITE)
+        self.uniform_buffer_staging.write_mapped(self.uniform_values)
+        self.node_queue_buffer_staging.write_mapped(node_queue_values)
+        self.uniform_buffer_staging.unmap()
+        self.node_queue_buffer_staging.unmap()
+
+        command_encoder.copy_buffer_to_buffer(
+            source=self.uniform_buffer_staging,
+            source_offset=0,
+            destination=self.uniform_buffer,
+            destination_offset=0,
+            size=self.uniform_values.nbytes,
+        )
+
+        command_encoder.copy_buffer_to_buffer(
+            source=self.node_queue_buffer_staging,
+            source_offset=0,
+            destination=self.node_queue_buffer,
+            destination_offset=0,
+            size=32,
+        )
+
+        compute_pass = command_encoder.begin_compute_pass()
+        compute_pass.set_pipeline(self.pipeline)
+        compute_pass.set_bind_group(0, bind_group)
+        compute_pass.dispatch_workgroups(number_of_bodies)
+        compute_pass.end()
+
+
 class RenderingPhase:
     rendering_shader_source = """
         struct VertexInput {
@@ -773,6 +1181,16 @@ class WgpuRenderer:
         self.context = self.canvas.get_context("wgpu")
         self.context.configure(device=self.device, format=None)
 
+        self.compute_point_tile_phase = ComputePointTilePhase(
+            self.device, self.number_of_points
+        )
+
+        self.tile_sort_phase = TileSortPhase(self.device)
+
+        self.compute_quad_tree_phase = ComputeQuadTreePhase(
+            self.device, self.number_of_points
+        )
+
         self.compute_accelerations_phase = ComputeAccelerationsPhase(
             self.number_of_points,
             self.device,
@@ -905,8 +1323,40 @@ class WgpuRenderer:
                     destination_offset=0,
                     size=self.number_of_points * 4 * 4,
                 )
+                self.compute_point_tile_phase.compute_pass(
+                    self.device,
+                    self.positions_buffer,
+                    command_encoder,
+                    self.simulation.separation,
+                )
+                for _ in range(self.simulation.init_substeps):
+                    k = 2
+                    while k <= self.number_of_points:
+                        j = k // 2
+                        while j > 0:
+                            self.tile_sort_phase.compute_pass(
+                                self.device,
+                                self.positions_buffer,
+                                self.prev_positions_buffer,
+                                self.compute_point_tile_phase.tiles_buffer,
+                                command_encoder,
+                                self.number_of_points,
+                                self.simulation.separation,
+                                k,
+                                j,
+                            )
+                            j //= 2
+                        k *= 2
 
-                for _ in range(self.simulation.substeps):
+                        self.compute_quad_tree_phase.compute_pass(
+                            self.device,
+                            self.positions_buffer,
+                            self.compute_point_tile_phase.tiles_buffer,
+                            command_encoder,
+                            self.number_of_points,
+                            self.simulation.separation,
+                        )
+
                     self.compute_impulses_phase.compute_pass(
                         self.device,
                         self.positions_buffer,
@@ -934,6 +1384,33 @@ class WgpuRenderer:
                 self.loaded = True
 
             for _ in range(self.simulation.substeps):
+                k = 2
+                while k <= self.number_of_points:
+                    j = k // 2
+                    while j > 0:
+                        self.tile_sort_phase.compute_pass(
+                            self.device,
+                            self.positions_buffer,
+                            self.prev_positions_buffer,
+                            self.compute_point_tile_phase.tiles_buffer,
+                            command_encoder,
+                            self.number_of_points,
+                            self.simulation.separation,
+                            k,
+                            j,
+                        )
+                        j //= 2
+                    k *= 2
+
+                    # self.compute_quad_tree_phase.compute_pass(
+                    #     self.device,
+                    #     self.positions_buffer,
+                    #     self.tile_sort_phase.tiles_buffer,
+                    #     command_encoder,
+                    #     self.number_of_points,
+                    #     self.simulation.separation,
+                    # )
+
                 self.compute_accelerations_phase.compute_pass(
                     self.device,
                     self.positions_buffer,
