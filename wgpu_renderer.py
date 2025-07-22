@@ -2,142 +2,42 @@ import wgpu
 from wgpu.gui.auto import WgpuCanvas, run
 import numpy as np
 
-setup_compute_shader_source = """
-    override separation: f32;
-    override gravitational_constant: f32;
-    override dt: f32;
-    override number_of_bodies: u32;
-    override substeps: u32;
-    @group(0) @binding(0) var<storage, read_write> positions: array<vec2<f32>>;
-    @group(0) @binding(1) var<storage, read_write> prev_positions: array<vec2<f32>>;
-    @group(0) @binding(2) var<storage, read_write> colors: array<vec4<f32>>;
-
-    @compute @workgroup_size(1, 1, 1) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-        let i = id.x;
-        for (var k = 0u; k < substeps; k++) {
-            let p = positions[i];
-            var resolve: vec2<f32> = vec2<f32>(0, 0);
-            for (var j = 0u; j < number_of_bodies; j++) {
-                let q = positions[j];
-                let d = distance(q, p);
-                if (d > 1e-5) && (d < 2 * separation) {
-                    resolve = resolve + (p - q) / d * (2 * separation - d) / 2;
-                }
-            }
-            storageBarrier();
-            positions[i] = p + resolve;
-            storageBarrier();
-        }
-        colors[i] = colors[i];
-        prev_positions[i] = positions[i];
-    }
-"""
-
-physics_compute_shader_source = """
-    override separation: f32;
-    override gravitational_constant: f32;
-    override dt: f32;
-    override number_of_bodies: u32;
-    override substeps: u32;
-    @group(0) @binding(0) var<storage, read_write> positions: array<vec2<f32>>;
-    @group(0) @binding(1) var<storage, read_write> prev_positions: array<vec2<f32>>;
-    @group(0) @binding(2) var<storage, read_write> colors: array<vec4<f32>>;
-
-    @compute @workgroup_size(1, 1, 1) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-        let i = id.x;
-        for (var k = 0u; k < substeps; k++) {
-            let p = positions[i];
-            let prev_p = prev_positions[i];
-            var accel: vec2<f32> = vec2<f32>(0, 0);
-            for (var j = 0u; j < number_of_bodies; j++) {
-                let q = positions[j];
-                let d = distance(q, p);
-                if d >= 2 * separation {
-                    accel = accel + (q - p) / pow(d, 3.0);
-                } 
-            } 
-            let new_p = 2.0 * p - prev_p + accel * dt * dt * gravitational_constant;
-            storageBarrier();
-            positions[i] = new_p;
-            prev_positions[i] = p;
-            storageBarrier();
-
-            var resolve: vec2<f32> = vec2<f32>(0, 0);
-            for (var j = 0u; j < number_of_bodies; j++) {
-                let q = positions[j];
-                let d = distance(q, new_p);
-                if (d > 1e-5) && (d < 2 * separation) {
-                    resolve = resolve + (new_p - q) / d * (2 * separation - d) / 2;
-                }
-            }
-            storageBarrier();
-            positions[i] = new_p + resolve;
-            storageBarrier();
-        }
-        colors[i] = colors[i];
-    }
-"""
-
-tessellation_compute_shader_source = """
-    @group(0) @binding(0) var<storage, read>  positions: array<vec2<f32>>;
-    @group(0) @binding(1) var<storage, read>  colors: array<vec4<f32>>;
-    @group(0) @binding(2) var<storage, read_write> vertex_positions: array<vec2<f32>>;
-    @group(0) @binding(3) var<storage, read_write> vertex_colors: array<vec4<f32>>;
-    override point_resolution: u32;
-    override point_radius: f32;
-    @compute @workgroup_size(1, 1, 1) fn generate_verticies(@builtin(global_invocation_id) id: vec3<u32>) {
-        let i = id.x;
-        let pi = acos(-1.0);
-        let pos = positions[i];
-        let col = colors[i];
-        for (var j = 0u; j < point_resolution; j++) {
-            vertex_positions[i * point_resolution * 3u + j * 3u + 0u] = pos;
-            vertex_positions[i * point_resolution * 3u + j * 3u + 1u] = pos + vec2<f32>(cos(f32(j) / f32(point_resolution) * 2 * pi), sin(f32(j) / f32(point_resolution) * 2 * pi)) * point_radius;
-            vertex_positions[i * point_resolution * 3u + j * 3u + 2u] = pos + vec2<f32>(cos(f32(j + 1u) / f32(point_resolution) * 2 * pi), sin(f32(j + 1u) / f32(point_resolution) * 2 * pi)) * point_radius;
-            vertex_colors[i * point_resolution * 3u + j * 3u + 0u] = col;
-            vertex_colors[i * point_resolution * 3u + j * 3u + 1u] = col;
-            vertex_colors[i * point_resolution * 3u + j * 3u + 2u] = col;
-        }
-    }
-"""
-
-rendering_shader_source = """
-    struct VertexInput {
-        @location(0) pos : vec2<f32>,
-        @location(1) color : vec4<f32>,
-        @builtin(vertex_index) vertex_index : u32,
-    };
-    struct VertexOutput {
-        @location(0) color     : vec4<f32>,
-        @builtin(position) pos : vec4<f32>,
-    };
-
-    @vertex
-    fn vs_main(in: VertexInput) -> VertexOutput {
-        let index = i32(in.vertex_index);
-        var out: VertexOutput;
-        out.pos = vec4<f32>(in.pos, 0.0, 1.0);
-        out.color = in.color;
-        return out;
-    }
-
-    struct FragmentOutput {
-        @location(0) present_color : vec4<f32>,   
-        @location(1) save_color    : vec4<f32>,
-    };
-
-    @fragment
-    fn fs_main(in: VertexOutput) -> FragmentOutput {
-        var out: FragmentOutput;
-        let physical_color = pow(in.color.rgb, vec3<f32>(2.2));  // gamma correct
-        out.present_color = vec4<f32>(physical_color, in.color.a);
-        out.save_color = vec4<f32>(physical_color, in.color.a);
-        return out;
-    }
-    """
-
 
 class RenderingPhase:
+    rendering_shader_source = """
+        struct VertexInput {
+            @location(0) pos : vec2<f32>,
+            @location(1) color : vec4<f32>,
+            @builtin(vertex_index) vertex_index : u32,
+        };
+        struct VertexOutput {
+            @location(0) color     : vec4<f32>,
+            @builtin(position) pos : vec4<f32>,
+        };
+
+        @vertex
+        fn vs_main(in: VertexInput) -> VertexOutput {
+            let index = i32(in.vertex_index);
+            var out: VertexOutput;
+            out.pos = vec4<f32>(in.pos, 0.0, 1.0);
+            out.color = in.color;
+            return out;
+        }
+
+        struct FragmentOutput {
+            @location(0) present_color : vec4<f32>,   
+            @location(1) save_color    : vec4<f32>,
+        };
+
+        @fragment
+        fn fs_main(in: VertexOutput) -> FragmentOutput {
+            var out: FragmentOutput;
+            let physical_color = pow(in.color.rgb, vec3<f32>(2.2));  // gamma correct
+            out.present_color = vec4<f32>(physical_color, in.color.a);
+            out.save_color = vec4<f32>(physical_color, in.color.a);
+            return out;
+        }
+    """
 
     def __init__(self, device, context, window_width, window_height):
         pipeline_kwargs = self.get_pipeline_kwargs(device, context)
@@ -167,8 +67,8 @@ class RenderingPhase:
         self,
         command_encoder,
         current_texture,
-        vertex_position_buffer,
-        vertex_color_buffer,
+        vertex_positions_buffer,
+        vertex_colors_buffer,
         number_of_points,
         point_resolution,
     ):
@@ -192,17 +92,17 @@ class RenderingPhase:
         )
         render_pass.set_pipeline(self.pipeline)
         render_pass.set_vertex_buffer(
-            slot=0, buffer=vertex_position_buffer, offset=0, size=None
+            slot=0, buffer=vertex_positions_buffer, offset=0, size=None
         )
         render_pass.set_vertex_buffer(
-            slot=1, buffer=vertex_color_buffer, offset=0, size=None
+            slot=1, buffer=vertex_colors_buffer, offset=0, size=None
         )
         render_pass.draw(number_of_points * point_resolution * 3, 1, 0, 0)
         render_pass.end()
 
     def get_pipeline_kwargs(self, device, context):
         render_texture_format = context.get_preferred_format(device.adapter)
-        shader = device.create_shader_module(code=rendering_shader_source)
+        shader = device.create_shader_module(code=self.rendering_shader_source)
         pipeline_layout = device.create_pipeline_layout(bind_group_layouts=[])
 
         return dict(
@@ -262,22 +162,45 @@ class RenderingPhase:
         )
 
 
-class SetupPhase:
+class ComputeAccelerationsPhase:
+    compute_accelerations_shader_source = """
+        override separation: f32;
+        override gravitational_constant: f32;
+        override dt: f32;
+        override number_of_bodies: u32;
+        @group(0) @binding(0) var<storage, read> positions: array<vec2<f32>>;
+        @group(0) @binding(1) var<storage, read_write> accelerations: array<vec2<f32>>;
+
+        @compute @workgroup_size(1, 1, 1) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+            let i = id.x;
+            let p = positions[i];
+            var accel: vec2<f32> = vec2<f32>(0, 0);
+            for (var j = 0u; j < number_of_bodies; j++) {
+                let q = positions[j];
+                let d = distance(q, p);
+                if d >= 2 * separation {
+                    accel = accel + (q - p) / pow(d, 3.0);
+                } 
+            } 
+            accelerations[i] = accel;
+        }
+    """
 
     def __init__(
-        self, number_of_bodies, device, separation, gravitational_constant, dt, substeps
+        self, number_of_bodies, device, separation, gravitational_constant, dt
     ):
         self.number_of_bodies = number_of_bodies
         self.separation = separation
         self.gravitational_constant = gravitational_constant
         self.dt = dt
-        self.substeps = substeps
 
         pipeline_kwargs = self.get_pipeline_kwargs(device)
         self.pipeline = device.create_compute_pipeline(**pipeline_kwargs)
 
     def get_pipeline_kwargs(self, device):
-        shader = device.create_shader_module(code=setup_compute_shader_source)
+        shader = device.create_shader_module(
+            code=self.compute_accelerations_shader_source
+        )
         return dict(
             layout=wgpu.enums.AutoLayoutMode.auto,
             compute={
@@ -288,25 +211,22 @@ class SetupPhase:
                     "gravitational_constant": self.gravitational_constant,
                     "dt": self.dt,
                     "number_of_bodies": self.number_of_bodies,
-                    "substeps": self.substeps,
                 },
             },
         )
 
-    def setup_pass(
+    def compute_pass(
         self,
         device,
-        position_buffer,
-        prev_position_buffer,
-        color_buffer,
+        positions_buffer,
+        acceleratios_buffer,
         command_encoder,
     ):
         bind_group = device.create_bind_group(
             layout=self.pipeline.get_bind_group_layout(0),
             entries=[
-                {"binding": 0, "resource": {"buffer": position_buffer}},
-                {"binding": 1, "resource": {"buffer": prev_position_buffer}},
-                {"binding": 2, "resource": {"buffer": color_buffer}},
+                {"binding": 0, "resource": {"buffer": positions_buffer}},
+                {"binding": 1, "resource": {"buffer": acceleratios_buffer}},
             ],
         )
 
@@ -317,22 +237,112 @@ class SetupPhase:
         compute_pass.end()
 
 
-class PhysicsPhase:
+class ApplyAccelerationsPhase:
+    apply_accelerations_shader_source = """
+        override gravitational_constant: f32;
+        override dt: f32;
+        @group(0) @binding(0) var<storage, read_write> positions: array<vec2<f32>>;
+        @group(0) @binding(1) var<storage, read_write> prev_positions: array<vec2<f32>>;
+        @group(0) @binding(2) var<storage, read> accelerations: array<vec2<f32>>;
 
-    def __init__(
-        self, number_of_bodies, device, separation, gravitational_constant, dt, substeps
-    ):
-        self.number_of_bodies = number_of_bodies
-        self.separation = separation
+        @compute @workgroup_size(1, 1, 1) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+            let i = id.x;
+            let p = positions[i];
+            let prev_p = prev_positions[i];
+            let accel = accelerations[i];
+            let new_p = 2.0 * p - prev_p + accel * dt * dt * gravitational_constant;
+            prev_positions[i] = p;
+            positions[i] = new_p;
+        }
+    """
+
+    def __init__(self, device, gravitational_constant, dt):
         self.gravitational_constant = gravitational_constant
         self.dt = dt
-        self.substeps = substeps
 
         pipeline_kwargs = self.get_pipeline_kwargs(device)
         self.pipeline = device.create_compute_pipeline(**pipeline_kwargs)
 
     def get_pipeline_kwargs(self, device):
-        shader = device.create_shader_module(code=physics_compute_shader_source)
+        shader = device.create_shader_module(
+            code=self.apply_accelerations_shader_source
+        )
+        return dict(
+            layout=wgpu.enums.AutoLayoutMode.auto,
+            compute={
+                "module": shader,
+                "entry_point": "main",
+                "constants": {
+                    "gravitational_constant": self.gravitational_constant,
+                    "dt": self.dt,
+                },
+            },
+        )
+
+    def compute_pass(
+        self,
+        device,
+        positions_buffer,
+        prev_positions_buffer,
+        acceleratios_buffer,
+        command_encoder,
+        number_of_bodies,
+    ):
+        bind_group = device.create_bind_group(
+            layout=self.pipeline.get_bind_group_layout(0),
+            entries=[
+                {"binding": 0, "resource": {"buffer": positions_buffer}},
+                {"binding": 1, "resource": {"buffer": prev_positions_buffer}},
+                {"binding": 2, "resource": {"buffer": acceleratios_buffer}},
+            ],
+        )
+
+        compute_pass = command_encoder.begin_compute_pass()
+        compute_pass.set_pipeline(self.pipeline)
+        compute_pass.set_bind_group(0, bind_group)
+        compute_pass.dispatch_workgroups(number_of_bodies)
+        compute_pass.end()
+
+
+class ComputeAccelerationsPhase:
+    compute_accelerations_shader_source = """
+        override separation: f32;
+        override gravitational_constant: f32;
+        override dt: f32;
+        override number_of_bodies: u32;
+        @group(0) @binding(0) var<storage, read> positions: array<vec2<f32>>;
+        @group(0) @binding(1) var<storage, read_write> accelerations: array<vec2<f32>>;
+
+        @compute @workgroup_size(1, 1, 1) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+            let i = id.x;
+            let p = positions[i];
+            var accel: vec2<f32> = vec2<f32>(0, 0);
+            for (var j = 0u; j < number_of_bodies; j++) {
+                let q = positions[j];
+                let d = distance(q, p);
+                if d >= 2 * separation {
+                    accel = accel + (q - p) / pow(d, 3.0);
+                } 
+            } 
+            accelerations[i] = accel;
+        }
+    """
+
+    def __init__(
+        self, number_of_bodies, device, separation, gravitational_constant, dt
+    ):
+        self.number_of_bodies = number_of_bodies
+        self.separation = separation
+        self.gravitational_constant = gravitational_constant
+        self.dt = dt
+
+        pipeline_kwargs = self.get_pipeline_kwargs(device)
+        self.pipeline = device.create_compute_pipeline(**pipeline_kwargs)
+
+    def get_pipeline_kwargs(self, device):
+        shader = device.create_shader_module(
+            code=self.compute_accelerations_shader_source
+        )
         return dict(
             layout=wgpu.enums.AutoLayoutMode.auto,
             compute={
@@ -343,36 +353,304 @@ class PhysicsPhase:
                     "gravitational_constant": self.gravitational_constant,
                     "dt": self.dt,
                     "number_of_bodies": self.number_of_bodies,
-                    "substeps": self.substeps,
                 },
             },
         )
 
-    def physics_pass(
+    def compute_pass(
         self,
         device,
-        position_buffer,
-        prev_position_buffer,
-        color_buffer,
+        positions_buffer,
+        acceleratios_buffer,
         command_encoder,
+        number_of_bodies,
     ):
         bind_group = device.create_bind_group(
             layout=self.pipeline.get_bind_group_layout(0),
             entries=[
-                {"binding": 0, "resource": {"buffer": position_buffer}},
-                {"binding": 1, "resource": {"buffer": prev_position_buffer}},
-                {"binding": 2, "resource": {"buffer": color_buffer}},
+                {"binding": 0, "resource": {"buffer": positions_buffer}},
+                {"binding": 1, "resource": {"buffer": acceleratios_buffer}},
             ],
         )
 
         compute_pass = command_encoder.begin_compute_pass()
         compute_pass.set_pipeline(self.pipeline)
         compute_pass.set_bind_group(0, bind_group)
-        compute_pass.dispatch_workgroups(self.number_of_bodies)
+        compute_pass.dispatch_workgroups(number_of_bodies)
+        compute_pass.end()
+
+
+class ApplyImpulsesPhase:
+    apply_impulses_shader_source = """
+        @group(0) @binding(0) var<storage, read_write> positions: array<vec2<f32>>;
+        @group(0) @binding(1) var<storage, read> impulses: array<vec2<f32>>;
+
+        @compute @workgroup_size(1, 1, 1) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+            let i = id.x;
+            positions[i] = positions[i] + impulses[i];
+        }
+    """
+
+    def __init__(self, device):
+        pipeline_kwargs = self.get_pipeline_kwargs(device)
+        self.pipeline = device.create_compute_pipeline(**pipeline_kwargs)
+
+    def get_pipeline_kwargs(self, device):
+        shader = device.create_shader_module(code=self.apply_impulses_shader_source)
+        return dict(
+            layout=wgpu.enums.AutoLayoutMode.auto,
+            compute={
+                "module": shader,
+                "entry_point": "main",
+            },
+        )
+
+    def compute_pass(
+        self,
+        device,
+        positions_buffer,
+        impulses_buffer,
+        command_encoder,
+        number_of_bodies,
+    ):
+        bind_group = device.create_bind_group(
+            layout=self.pipeline.get_bind_group_layout(0),
+            entries=[
+                {"binding": 0, "resource": {"buffer": positions_buffer}},
+                {"binding": 1, "resource": {"buffer": impulses_buffer}},
+            ],
+        )
+
+        compute_pass = command_encoder.begin_compute_pass()
+        compute_pass.set_pipeline(self.pipeline)
+        compute_pass.set_bind_group(0, bind_group)
+        compute_pass.dispatch_workgroups(number_of_bodies)
+        compute_pass.end()
+
+
+class ComputeImpulsesPhase:
+    compute_impulses_shader_source = """
+        override separation: f32;
+        override number_of_bodies: u32;
+        @group(0) @binding(0) var<storage, read> positions: array<vec2<f32>>;
+        @group(0) @binding(1) var<storage, read_write> impulses: array<vec2<f32>>;
+
+        @compute @workgroup_size(1, 1, 1) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+            let i = id.x;
+            let p = positions[i];
+            var impulse: vec2<f32> = vec2<f32>(0, 0);
+            for (var j = 0u; j < number_of_bodies; j++) {
+                let q = positions[j];
+                let d = distance(q, p);
+                if (d > 1e-5) && (d < 2 * separation) {
+                    impulse = impulse + (p - q) / d * (2 * separation - d) / 2;
+                }
+            }
+            impulses[i] = impulse;
+        }
+    """
+
+    def __init__(self, number_of_bodies, device, separation):
+        self.number_of_bodies = number_of_bodies
+        self.separation = separation
+
+        pipeline_kwargs = self.get_pipeline_kwargs(device)
+        self.pipeline = device.create_compute_pipeline(**pipeline_kwargs)
+
+    def get_pipeline_kwargs(self, device):
+        shader = device.create_shader_module(code=self.compute_impulses_shader_source)
+        return dict(
+            layout=wgpu.enums.AutoLayoutMode.auto,
+            compute={
+                "module": shader,
+                "entry_point": "main",
+                "constants": {
+                    "separation": self.separation,
+                    "number_of_bodies": self.number_of_bodies,
+                },
+            },
+        )
+
+    def compute_pass(
+        self,
+        device,
+        positions_buffer,
+        impulses_buffer,
+        command_encoder,
+        number_of_bodies,
+    ):
+        bind_group = device.create_bind_group(
+            layout=self.pipeline.get_bind_group_layout(0),
+            entries=[
+                {"binding": 0, "resource": {"buffer": positions_buffer}},
+                {"binding": 1, "resource": {"buffer": impulses_buffer}},
+            ],
+        )
+
+        compute_pass = command_encoder.begin_compute_pass()
+        compute_pass.set_pipeline(self.pipeline)
+        compute_pass.set_bind_group(0, bind_group)
+        compute_pass.dispatch_workgroups(number_of_bodies)
+        compute_pass.end()
+
+
+class SetupVelocitiesPhase:
+    setup_velocities_shader_source = """
+        override initial_spin: f32;
+        override dt: f32;
+        @group(0) @binding(0) var<storage, read_write> positions: array<vec2<f32>>;
+        @group(0) @binding(1) var<storage, read_write> prev_positions: array<vec2<f32>>;
+
+        @compute @workgroup_size(1, 1, 1) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+            let i = id.x;
+            let p = positions[i];
+            let p_conj = vec2<f32>(-p.y, p.x);
+            let prev_p = prev_positions[i];
+
+            prev_positions[i] = p;
+            positions[i] = p + p_conj * initial_spin * dt;
+        }
+    """
+
+    def __init__(self, device, initial_spin, dt):
+        self.initial_spin = initial_spin
+        self.dt = dt
+
+        pipeline_kwargs = self.get_pipeline_kwargs(device)
+        self.pipeline = device.create_compute_pipeline(**pipeline_kwargs)
+
+    def get_pipeline_kwargs(self, device):
+        shader = device.create_shader_module(code=self.setup_velocities_shader_source)
+        return dict(
+            layout=wgpu.enums.AutoLayoutMode.auto,
+            compute={
+                "module": shader,
+                "entry_point": "main",
+                "constants": {
+                    "initial_spin": self.initial_spin,
+                    "dt": self.dt,
+                },
+            },
+        )
+
+    def compute_pass(
+        self,
+        device,
+        positions_buffer,
+        prev_positions_buffer,
+        command_encoder,
+        number_of_bodies,
+    ):
+        bind_group = device.create_bind_group(
+            layout=self.pipeline.get_bind_group_layout(0),
+            entries=[
+                {"binding": 0, "resource": {"buffer": positions_buffer}},
+                {"binding": 1, "resource": {"buffer": prev_positions_buffer}},
+            ],
+        )
+
+        compute_pass = command_encoder.begin_compute_pass()
+        compute_pass.set_pipeline(self.pipeline)
+        compute_pass.set_bind_group(0, bind_group)
+        compute_pass.dispatch_workgroups(number_of_bodies)
+        compute_pass.end()
+
+
+class ComputeColorPhase:
+    compute_color_shader_source = """
+        override dt: f32;
+        @group(0) @binding(0) var<storage, read> positions: array<vec2<f32>>;
+        @group(0) @binding(1) var<storage, read> prev_positions: array<vec2<f32>>;
+        @group(0) @binding(2) var<storage, read_write> colors: array<vec4<f32>>;
+
+        @compute @workgroup_size(1, 1, 1) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+            let i = id.x;
+            let p = positions[i];
+            let prev_p = prev_positions[i];
+            
+            let velocity = (p - prev_p) / dt;
+            let len = length(velocity);
+
+            if len < 1e-5 {
+                colors[i] = vec4<f32>(1.0, 1.0, 1.0, 1.0);
+            } else { 
+                let direction = velocity / len;
+                let scale = 100.0;
+                let saturation = 1.0 - exp(-scale*len*len / 2.0);
+                let hue = vec4<f32>(direction.x, direction.y, 0.0, 1.0) / 2.0 + 0.5;
+                colors[i] = saturation * hue + (1.0 - saturation) * vec4<f32>(1.0, 1.0, 1.0, 1.0);
+            }
+
+
+        }
+    """
+
+    def __init__(self, device, dt):
+        self.dt = dt
+        pipeline_kwargs = self.get_pipeline_kwargs(device)
+        self.pipeline = device.create_compute_pipeline(**pipeline_kwargs)
+
+    def get_pipeline_kwargs(self, device):
+        shader = device.create_shader_module(code=self.compute_color_shader_source)
+        return dict(
+            layout=wgpu.enums.AutoLayoutMode.auto,
+            compute={
+                "module": shader,
+                "entry_point": "main",
+                "constants": {
+                    "dt": self.dt,
+                },
+            },
+        )
+
+    def compute_pass(
+        self,
+        device,
+        positions_buffer,
+        prev_positions_buffer,
+        command_encoder,
+        number_of_bodies,
+        colors_buffer,
+    ):
+        bind_group = device.create_bind_group(
+            layout=self.pipeline.get_bind_group_layout(0),
+            entries=[
+                {"binding": 0, "resource": {"buffer": positions_buffer}},
+                {"binding": 1, "resource": {"buffer": prev_positions_buffer}},
+                {"binding": 2, "resource": {"buffer": colors_buffer}},
+            ],
+        )
+
+        compute_pass = command_encoder.begin_compute_pass()
+        compute_pass.set_pipeline(self.pipeline)
+        compute_pass.set_bind_group(0, bind_group)
+        compute_pass.dispatch_workgroups(number_of_bodies)
         compute_pass.end()
 
 
 class TessellationPhase:
+    tessellation_compute_shader_source = """
+        @group(0) @binding(0) var<storage, read>  positions: array<vec2<f32>>;
+        @group(0) @binding(1) var<storage, read>  colors: array<vec4<f32>>;
+        @group(0) @binding(2) var<storage, read_write> vertex_positions: array<vec2<f32>>;
+        @group(0) @binding(3) var<storage, read_write> vertex_colors: array<vec4<f32>>;
+        override point_resolution: u32;
+        override point_radius: f32;
+        @compute @workgroup_size(1, 1, 1) fn generate_verticies(@builtin(global_invocation_id) id: vec3<u32>) {
+            let i = id.x;
+            let pi = acos(-1.0);
+            let pos = positions[i];
+            let col = colors[i];
+            for (var j = 0u; j < point_resolution; j++) {
+                vertex_positions[i * point_resolution * 3u + j * 3u + 0u] = pos;
+                vertex_positions[i * point_resolution * 3u + j * 3u + 1u] = pos + vec2<f32>(cos(f32(j) / f32(point_resolution) * 2 * pi), sin(f32(j) / f32(point_resolution) * 2 * pi)) * point_radius;
+                vertex_positions[i * point_resolution * 3u + j * 3u + 2u] = pos + vec2<f32>(cos(f32(j + 1u) / f32(point_resolution) * 2 * pi), sin(f32(j + 1u) / f32(point_resolution) * 2 * pi)) * point_radius;
+                vertex_colors[i * point_resolution * 3u + j * 3u + 0u] = col;
+                vertex_colors[i * point_resolution * 3u + j * 3u + 1u] = col;
+                vertex_colors[i * point_resolution * 3u + j * 3u + 2u] = col;
+            }
+        }
+    """
 
     def __init__(self, number_of_points, point_resolution, point_radius, device):
         self.point_radius = point_radius
@@ -382,28 +660,30 @@ class TessellationPhase:
         pipeline_kwargs = self.get_pipeline_kwargs(device)
         self.pipeline = device.create_compute_pipeline(**pipeline_kwargs)
 
-        self.vertex_color_buffer = device.create_buffer(
+        self.vertex_colors_buffer = device.create_buffer(
             size=self.number_of_points * self.point_resolution * 3 * 4 * 4,
             usage=wgpu.BufferUsage.COPY_DST + wgpu.BufferUsage.VERTEX,
         )
 
-        self.vertex_color_buffer_staging = device.create_buffer(
+        self.vertex_colors_buffer_staging = device.create_buffer(
             size=self.number_of_points * self.point_resolution * 3 * 4 * 4,
             usage=wgpu.BufferUsage.COPY_SRC + wgpu.BufferUsage.STORAGE,
         )
 
-        self.vertex_position_buffer = device.create_buffer(
+        self.vertex_positions_buffer = device.create_buffer(
             size=self.number_of_points * self.point_resolution * 3 * 2 * 4,
             usage=wgpu.BufferUsage.COPY_DST + wgpu.BufferUsage.VERTEX,
         )
 
-        self.vertex_position_buffer_staging = device.create_buffer(
+        self.vertex_positions_buffer_staging = device.create_buffer(
             size=self.number_of_points * self.point_resolution * 3 * 2 * 4,
             usage=wgpu.BufferUsage.COPY_SRC + wgpu.BufferUsage.STORAGE,
         )
 
     def get_pipeline_kwargs(self, device):
-        shader = device.create_shader_module(code=tessellation_compute_shader_source)
+        shader = device.create_shader_module(
+            code=self.tessellation_compute_shader_source
+        )
         return dict(
             layout=wgpu.enums.AutoLayoutMode.auto,
             compute={
@@ -419,22 +699,22 @@ class TessellationPhase:
     def tesselation_pass(
         self,
         device,
-        position_buffer,
-        color_buffer,
+        positions_buffer,
+        colors_buffer,
         command_encoder,
     ):
         command_encoder.copy_buffer_to_buffer(
-            source=self.vertex_position_buffer_staging,
+            source=self.vertex_positions_buffer_staging,
             source_offset=0,
-            destination=self.vertex_position_buffer,
+            destination=self.vertex_positions_buffer,
             destination_offset=0,
             size=self.number_of_points * self.point_resolution * 3 * 2 * 4,
         )
 
         command_encoder.copy_buffer_to_buffer(
-            source=self.vertex_color_buffer_staging,
+            source=self.vertex_colors_buffer_staging,
             source_offset=0,
-            destination=self.vertex_color_buffer,
+            destination=self.vertex_colors_buffer,
             destination_offset=0,
             size=self.number_of_points * self.point_resolution * 3 * 4 * 4,
         )
@@ -442,15 +722,15 @@ class TessellationPhase:
         bind_group = device.create_bind_group(
             layout=self.pipeline.get_bind_group_layout(0),
             entries=[
-                {"binding": 0, "resource": {"buffer": position_buffer}},
-                {"binding": 1, "resource": {"buffer": color_buffer}},
+                {"binding": 0, "resource": {"buffer": positions_buffer}},
+                {"binding": 1, "resource": {"buffer": colors_buffer}},
                 {
                     "binding": 2,
-                    "resource": {"buffer": self.vertex_position_buffer_staging},
+                    "resource": {"buffer": self.vertex_positions_buffer_staging},
                 },
                 {
                     "binding": 3,
-                    "resource": {"buffer": self.vertex_color_buffer_staging},
+                    "resource": {"buffer": self.vertex_colors_buffer_staging},
                 },
             ],
         )
@@ -493,23 +773,33 @@ class WgpuRenderer:
         self.context = self.canvas.get_context("wgpu")
         self.context.configure(device=self.device, format=None)
 
-        self.setup_phase = SetupPhase(
+        self.compute_accelerations_phase = ComputeAccelerationsPhase(
             self.number_of_points,
             self.device,
             self.simulation.separation,
             self.simulation.gravitational_constant,
             self.simulation.dt,
-            self.simulation.substeps,
         )
 
-        self.physics_phase = PhysicsPhase(
+        self.apply_accelerations_phase = ApplyAccelerationsPhase(
+            self.device,
+            self.simulation.gravitational_constant,
+            self.simulation.dt,
+        )
+
+        self.compute_impulses_phase = ComputeImpulsesPhase(
             self.number_of_points,
             self.device,
             self.simulation.separation,
-            self.simulation.gravitational_constant,
-            self.simulation.dt,
-            self.simulation.substeps,
         )
+
+        self.apply_impulses_phase = ApplyImpulsesPhase(self.device)
+
+        self.setup_velocities_phase = SetupVelocitiesPhase(
+            self.device, self.simulation.initial_spin, self.simulation.dt
+        )
+
+        self.compute_colors_phase = ComputeColorPhase(self.device, self.simulation.dt)
 
         self.tessellation_phase = TessellationPhase(
             self.number_of_points, self.point_resolution, self.point_radius, self.device
@@ -519,34 +809,44 @@ class WgpuRenderer:
             self.device, self.context, self.window_width, self.window_height
         )
 
-        self.color_buffer = self.device.create_buffer(
+        self.colors_buffer = self.device.create_buffer(
             size=self.number_of_points * 4 * 4,
             usage=wgpu.BufferUsage.COPY_DST + wgpu.BufferUsage.STORAGE,
         )
 
-        self.color_buffer_staging = self.device.create_buffer(
+        self.colors_buffer_staging = self.device.create_buffer(
             size=self.number_of_points * 4 * 4,
             usage=wgpu.BufferUsage.MAP_WRITE + wgpu.BufferUsage.COPY_SRC,
         )
 
-        self.position_buffer = self.device.create_buffer(
+        self.positions_buffer = self.device.create_buffer(
             size=self.number_of_points * 2 * 4,
             usage=wgpu.BufferUsage.COPY_DST + wgpu.BufferUsage.STORAGE,
         )
 
-        self.position_buffer_staging = self.device.create_buffer(
+        self.positions_buffer_staging = self.device.create_buffer(
             size=self.number_of_points * 2 * 4,
             usage=wgpu.BufferUsage.MAP_WRITE + wgpu.BufferUsage.COPY_SRC,
         )
 
-        self.prev_position_buffer = self.device.create_buffer(
+        self.prev_positions_buffer = self.device.create_buffer(
             size=self.number_of_points * 2 * 4,
             usage=wgpu.BufferUsage.COPY_DST + wgpu.BufferUsage.STORAGE,
         )
 
-        self.prev_position_buffer_staging = self.device.create_buffer(
+        self.prev_positions_buffer_staging = self.device.create_buffer(
             size=self.number_of_points * 2 * 4,
             usage=wgpu.BufferUsage.MAP_WRITE + wgpu.BufferUsage.COPY_SRC,
+        )
+
+        self.impulses_buffer = self.device.create_buffer(
+            size=self.number_of_points * 2 * 4,
+            usage=wgpu.BufferUsage.STORAGE,
+        )
+
+        self.accelerations_buffer = self.device.create_buffer(
+            size=self.number_of_points * 2 * 4,
+            usage=wgpu.BufferUsage.STORAGE,
         )
 
         width_blocks = (self.window_width * 4 + 255) // 256
@@ -570,69 +870,121 @@ class WgpuRenderer:
             command_encoder = self.device.create_command_encoder()
 
             if not self.loaded:
-                self.position_buffer_staging.map_sync(wgpu.MapMode.WRITE)
-                self.prev_position_buffer_staging.map_sync(wgpu.MapMode.WRITE)
-                self.color_buffer_staging.map_sync(wgpu.MapMode.WRITE)
+                self.positions_buffer_staging.map_sync(wgpu.MapMode.WRITE)
+                self.prev_positions_buffer_staging.map_sync(wgpu.MapMode.WRITE)
+                self.colors_buffer_staging.map_sync(wgpu.MapMode.WRITE)
 
-                self.position_buffer_staging.write_mapped(positions)
-                self.prev_position_buffer_staging.write_mapped(prev_positions)
-                self.color_buffer_staging.write_mapped(colors)
+                self.positions_buffer_staging.write_mapped(positions)
+                self.prev_positions_buffer_staging.write_mapped(prev_positions)
+                self.colors_buffer_staging.write_mapped(colors)
 
-                self.position_buffer_staging.unmap()
-                self.prev_position_buffer_staging.unmap()
-                self.color_buffer_staging.unmap()
+                self.positions_buffer_staging.unmap()
+                self.prev_positions_buffer_staging.unmap()
+                self.colors_buffer_staging.unmap()
 
                 command_encoder.copy_buffer_to_buffer(
-                    source=self.position_buffer_staging,
+                    source=self.positions_buffer_staging,
                     source_offset=0,
-                    destination=self.position_buffer,
+                    destination=self.positions_buffer,
                     destination_offset=0,
                     size=self.number_of_points * 2 * 4,
                 )
 
                 command_encoder.copy_buffer_to_buffer(
-                    source=self.prev_position_buffer_staging,
+                    source=self.prev_positions_buffer_staging,
                     source_offset=0,
-                    destination=self.prev_position_buffer,
+                    destination=self.prev_positions_buffer,
                     destination_offset=0,
                     size=self.number_of_points * 2 * 4,
                 )
 
                 command_encoder.copy_buffer_to_buffer(
-                    source=self.color_buffer_staging,
+                    source=self.colors_buffer_staging,
                     source_offset=0,
-                    destination=self.color_buffer,
+                    destination=self.colors_buffer,
                     destination_offset=0,
                     size=self.number_of_points * 4 * 4,
                 )
 
-                self.setup_phase.setup_pass(
+                for _ in range(self.simulation.substeps):
+                    self.compute_impulses_phase.compute_pass(
+                        self.device,
+                        self.positions_buffer,
+                        self.impulses_buffer,
+                        command_encoder,
+                        self.number_of_points,
+                    )
+
+                    self.apply_impulses_phase.compute_pass(
+                        self.device,
+                        self.positions_buffer,
+                        self.impulses_buffer,
+                        command_encoder,
+                        self.number_of_points,
+                    )
+
+                self.setup_velocities_phase.compute_pass(
                     self.device,
-                    self.position_buffer,
-                    self.prev_position_buffer,
-                    self.color_buffer,
+                    self.positions_buffer,
+                    self.prev_positions_buffer,
                     command_encoder,
+                    self.number_of_points,
                 )
 
                 self.loaded = True
 
-            self.physics_phase.physics_pass(
+            for _ in range(self.simulation.substeps):
+                self.compute_accelerations_phase.compute_pass(
+                    self.device,
+                    self.positions_buffer,
+                    self.accelerations_buffer,
+                    command_encoder,
+                    self.number_of_points,
+                )
+
+                self.apply_accelerations_phase.compute_pass(
+                    self.device,
+                    self.positions_buffer,
+                    self.prev_positions_buffer,
+                    self.accelerations_buffer,
+                    command_encoder,
+                    self.number_of_points,
+                )
+
+                self.compute_impulses_phase.compute_pass(
+                    self.device,
+                    self.positions_buffer,
+                    self.impulses_buffer,
+                    command_encoder,
+                    self.number_of_points,
+                )
+
+                self.apply_impulses_phase.compute_pass(
+                    self.device,
+                    self.positions_buffer,
+                    self.impulses_buffer,
+                    command_encoder,
+                    self.number_of_points,
+                )
+
+            self.compute_colors_phase.compute_pass(
                 self.device,
-                self.position_buffer,
-                self.prev_position_buffer,
-                self.color_buffer,
+                self.positions_buffer,
+                self.prev_positions_buffer,
                 command_encoder,
+                self.number_of_points,
+                self.colors_buffer,
             )
 
             self.tessellation_phase.tesselation_pass(
-                self.device, self.position_buffer, self.color_buffer, command_encoder
+                self.device, self.positions_buffer, self.colors_buffer, command_encoder
             )
 
             self.rendering_phase.render_pass(
                 command_encoder,
                 current_texture,
-                self.tessellation_phase.vertex_position_buffer,
-                self.tessellation_phase.vertex_color_buffer,
+                self.tessellation_phase.vertex_positions_buffer,
+                self.tessellation_phase.vertex_colors_buffer,
                 self.number_of_points,
                 self.point_resolution,
             )
@@ -658,10 +1010,9 @@ class WgpuRenderer:
             self.color_output_buffer.map_sync(wgpu.MapMode.READ)
             image_mem = self.color_output_buffer.read_mapped()
             self.color_output_buffer.unmap()
-            padding = width_blocks * 256 - self.window_width * 4
             image_bytes_padded = np.frombuffer(
                 image_mem.tobytes(), dtype=np.byte
-            ).reshape((self.window_height, self.window_width + padding, 4))
+            ).reshape((self.window_height, width_blocks * 256 // 4, 4))
             image_array = image_bytes_padded[:, : self.window_width, :]
             self.simulation.end_frame(image_array)
             self.canvas.request_draw(draw_frame)
