@@ -26,6 +26,9 @@ class ComputePointTilePhase:
         @compute @workgroup_size(1, 1, 1) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             let i = id.x;
             let p = positions[i];
+            if uniforms.separation > 1e5 {
+                return;
+            }
             tiles[i] = point_to_tile(p);
         }
 
@@ -49,7 +52,7 @@ class ComputePointTilePhase:
         self.tiles_buffer = Buffer(
             device,
             (number_of_points,),
-            dtype=np.dtype("2f4"),
+            dtype=np.dtype("u4"),
             usage=wgpu.BufferUsage.STORAGE,
             query=True,
         )
@@ -120,13 +123,14 @@ class TileSortPhase:
 
         @compute @workgroup_size(1, 1, 1) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             let i = id.x;
-            let p = positions[i];
             let l = i ^ tile_sort_uniform.j;
+
             if l >= tile_sort_uniform.number_of_bodies {
                 return;
             }
+
             if l > i {
-                if ( ((i & tile_sort_uniform.k) == 0) && (compare(l, i))) || ( ((i & tile_sort_uniform.k) != 0) && (compare(i, l))) {
+                if ( ((i & tile_sort_uniform.k) == 0u) && (compare(l, i))) || ( ((i & tile_sort_uniform.k) != 0u) && (compare(i, l))) {
                     let temp_i = positions[i];
                     let temp_prev_i = prev_positions[i];
                     let temp_tile_i = tiles[i];
@@ -135,7 +139,7 @@ class TileSortPhase:
                     tiles[i] = tiles[l];
                     positions[l] = temp_i;
                     prev_positions[l] = temp_prev_i;
-                    tiles[l] = temp_tile_i; 
+                    tiles[l] = temp_tile_i;
                 }
             }
         }
@@ -192,7 +196,7 @@ class TileSortPhase:
                 {"binding": 3, "resource": {"buffer": self.uniform_buffer.buffer}},
             ],
         )
-
+        self.uniform_values = self.uniform_values.copy()
         self.uniform_values[0][0] = self.tree_bb_min
         self.uniform_values[0][1] = self.tree_bb_max
         self.uniform_values[0][2] = separation
@@ -574,14 +578,24 @@ class RenderingPhase:
                 {
                     "view": self.present_multisampled_texture.create_view(),
                     "resolve_target": current_texture.create_view(),
-                    "clear_value": (0, 0, 0, 1),
+                    "clear_value": (
+                        (22 / 255) ** 2.2,
+                        (22 / 255) ** 2.2,
+                        (29 / 255) ** 2.2,
+                        1,
+                    ),
                     "load_op": wgpu.LoadOp.clear,
                     "store_op": wgpu.StoreOp.store,
                 },
                 {
                     "view": self.color_texture.create_view(),
                     "resolve_target": self.color_resolve_texture.create_view(),
-                    "clear_value": (0, 0, 0, 1),
+                    "clear_value": (
+                        (22 / 255) ** 2.2,
+                        (22 / 255) ** 2.2,
+                        (29 / 255) ** 2.2,
+                        1,
+                    ),
                     "load_op": wgpu.LoadOp.clear,
                     "store_op": wgpu.StoreOp.store,
                 },
@@ -1280,9 +1294,19 @@ class WgpuRenderer:
             self.simulation.tree_bb_max,
         )
 
-        self.tile_sort_phase = TileSortPhase(
-            self.device, self.simulation.tree_bb_min, self.simulation.tree_bb_max
-        )
+        self.tile_sort_phase = {}
+
+        k = 2
+        while k <= self.number_of_points:
+            j = k // 2
+            while j > 0:
+                self.tile_sort_phase[(k, j)] = TileSortPhase(
+                    self.device,
+                    self.simulation.tree_bb_min,
+                    self.simulation.tree_bb_max,
+                )
+                j = j // 2
+            k = k * 2
 
         self.compute_quad_tree_phase = ComputeQuadTreePhase(
             self.device,
@@ -1413,7 +1437,7 @@ class WgpuRenderer:
                     while k <= self.number_of_points:
                         j = k // 2
                         while j > 0:
-                            self.tile_sort_phase.compute_pass(
+                            self.tile_sort_phase[(k, j)].compute_pass(
                                 self.device,
                                 self.positions_buffer,
                                 self.prev_positions_buffer,
@@ -1424,8 +1448,8 @@ class WgpuRenderer:
                                 k,
                                 j,
                             )
-                            j //= 2
-                        k *= 2
+                            j = j // 2
+                        k = k * 2
 
                     self.compute_point_tile_phase.tiles_buffer.store_query(
                         command_encoder
@@ -1464,33 +1488,6 @@ class WgpuRenderer:
                 )
 
                 self.loaded = True
-
-            for _ in range(self.simulation.substeps):
-                k = 2
-                while k <= self.number_of_points:
-                    j = k // 2
-                    while j > 0:
-                        self.tile_sort_phase.compute_pass(
-                            self.device,
-                            self.positions_buffer,
-                            self.prev_positions_buffer,
-                            self.compute_point_tile_phase.tiles_buffer,
-                            command_encoder,
-                            self.number_of_points,
-                            self.simulation.separation,
-                            k,
-                            j,
-                        )
-                        j //= 2
-                    k *= 2
-
-                    # self.compute_quad_tree_phase.compute_pass(
-                    #     self.device,
-                    #     self.positions_buffer,
-                    #     command_encoder,
-                    #     self.number_of_points,
-                    #     self.simulation.separation,
-                    # )
 
                 self.compute_accelerations_phase.compute_pass(
                     self.device,
@@ -1568,12 +1565,12 @@ class WgpuRenderer:
             node_array = np.frombuffer(
                 node_values, dtype=self.compute_quad_tree_phase.nodes_buffer.dtype
             )
-            # print(node_array)
+            print(node_array)
 
             tiles_values = self.compute_point_tile_phase.tiles_buffer.read_query()
 
             tiles_array = np.frombuffer(tiles_values, dtype=np.uint32)
-            # print(tiles_array)
+            print(tiles_array)
 
             self.color_output_buffer.map_sync(wgpu.MapMode.READ)
             image_mem = self.color_output_buffer.read_mapped()

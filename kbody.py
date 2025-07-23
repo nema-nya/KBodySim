@@ -6,8 +6,8 @@ from wgpu_renderer import WgpuRenderer
 class Simulation:
 
     def __init__(self):
-        self.number_of_points = 25
-        self.point_resolution = 32
+        self.number_of_points = 8
+        self.point_resolution = 256
         self.window_width = 1280
         self.window_height = 720
         self.separation = 0.01
@@ -17,8 +17,8 @@ class Simulation:
         self.dt = 1e-4
         self.frame_count = 600
         self.pole_distance = self.separation * 5
-        self.spawn_radius = 0.2
-        self.initial_spin = 0.4
+        self.spawn_radius = 0.1
+        self.initial_spin = 0.2
         self.init_substeps = 32
         self.max_tree_depth = 4
         self.tree_bb_min = (
