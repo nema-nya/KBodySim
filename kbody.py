@@ -1,13 +1,12 @@
 import numpy as np
 from ffmpeg_writer import FfmpegWriter
 from wgpu_renderer import WgpuRenderer
-from quad_tree_v2 import QuadTreeV2
 
 
 class Simulation:
 
     def __init__(self):
-        self.number_of_points = 100
+        self.number_of_points = 500
         self.point_resolution = 32
         self.window_width = 1024
         self.window_height = 1024
@@ -16,11 +15,15 @@ class Simulation:
         self.gravitational_constant = 0.001
         self.substeps = 8
         self.dt = 1e-4
-        self.frame_count = 900
+        self.frame_count = 300
         self.pole_distance = self.separation * 5
         self.spawn_radius = 0.5
         self.initial_spin = 0.4
         self.init_substeps = 32
+        self.max_tree_depth = 16
+        self.tree_bb_min = np.array([-1.0, -1.0]) * self.separation * 2**(self.max_tree_depth - 1)
+        self.tree_bb_max = np.array([1.0, 1.0]) * self.separation * 2**(self.max_tree_depth - 1)
+
         self.ffmpeg_writer = FfmpegWriter(
             "out.webm", self.window_width, self.window_height
         )
