@@ -1,6 +1,7 @@
 import wgpu
 from wgpu.gui.auto import WgpuCanvas, run
 import numpy as np
+from buffer import Buffer
 
 
 class ComputePointTilePhase:
@@ -37,19 +38,20 @@ class ComputePointTilePhase:
 
         self.uniform_values = np.zeros(shape=(1,), dtype=np.dtype("2f4,2f4,f4,4V"))
 
-        self.uniform_buffer = device.create_buffer(
-            size=self.uniform_values.nbytes,
-            usage=wgpu.BufferUsage.UNIFORM + wgpu.BufferUsage.COPY_DST,
+        self.uniform_buffer = Buffer(
+            device,
+            (1,),
+            dtype=np.dtype("2f4,2f4,f4,4V"),
+            usage=wgpu.BufferUsage.UNIFORM,
+            staging=True,
         )
 
-        self.uniform_buffer_staging = device.create_buffer(
-            size=self.uniform_values.nbytes,
-            usage=wgpu.BufferUsage.COPY_SRC + wgpu.BufferUsage.MAP_WRITE,
-        )
-
-        self.tiles_buffer = device.create_buffer(
-            size=number_of_points * 2 * 4,
+        self.tiles_buffer = Buffer(
+            device,
+            (number_of_points,),
+            dtype=np.dtype("2f4"),
             usage=wgpu.BufferUsage.STORAGE,
+            query=True,
         )
 
         pipeline_kwargs = self.get_pipeline_kwargs(device)
@@ -75,9 +77,9 @@ class ComputePointTilePhase:
         bind_group = device.create_bind_group(
             layout=self.pipeline.get_bind_group_layout(0),
             entries=[
-                {"binding": 0, "resource": {"buffer": positions_buffer}},
-                {"binding": 1, "resource": {"buffer": self.tiles_buffer}},
-                {"binding": 2, "resource": {"buffer": self.uniform_buffer}},
+                {"binding": 0, "resource": {"buffer": positions_buffer.buffer}},
+                {"binding": 1, "resource": {"buffer": self.tiles_buffer.buffer}},
+                {"binding": 2, "resource": {"buffer": self.uniform_buffer.buffer}},
             ],
         )
 
@@ -85,17 +87,9 @@ class ComputePointTilePhase:
         self.uniform_values[0][1] = self.tree_bb_max
         self.uniform_values[0][2] = separation
 
-        self.uniform_buffer_staging.map_sync(wgpu.MapMode.WRITE)
-        self.uniform_buffer_staging.write_mapped(self.uniform_values)
-        self.uniform_buffer_staging.unmap()
+        self.uniform_buffer.write_staging(self.uniform_values)
 
-        command_encoder.copy_buffer_to_buffer(
-            source=self.uniform_buffer_staging,
-            source_offset=0,
-            destination=self.uniform_buffer,
-            destination_offset=0,
-            size=self.uniform_values.nbytes,
-        )
+        self.uniform_buffer.load_staging(command_encoder)
 
         compute_pass = command_encoder.begin_compute_pass()
         compute_pass.set_pipeline(self.pipeline)
@@ -152,17 +146,16 @@ class TileSortPhase:
         self.tree_bb_min = tree_bb_min
         self.tree_bb_max = tree_bb_max
 
-        self.tile_sort_uniform_values = np.zeros(
+        self.uniform_values = np.zeros(
             shape=(1,), dtype=np.dtype("2f4,2f4,f4,u4,u4,u4")
         )
-        self.tile_sort_uniform_buffer = device.create_buffer(
-            size=self.tile_sort_uniform_values.nbytes,
-            usage=wgpu.BufferUsage.UNIFORM + wgpu.BufferUsage.COPY_DST,
-        )
 
-        self.tile_sort_uniform_buffer_staging = device.create_buffer(
-            size=self.tile_sort_uniform_values.nbytes,
-            usage=wgpu.BufferUsage.COPY_SRC + wgpu.BufferUsage.MAP_WRITE,
+        self.uniform_buffer = Buffer(
+            device=device,
+            shape=(1,),
+            dtype=np.dtype("2f4,2f4,f4,u4,u4,u4"),
+            usage=wgpu.BufferUsage.UNIFORM,
+            staging=True,
         )
 
         pipeline_kwargs = self.get_pipeline_kwargs(device)
@@ -193,33 +186,22 @@ class TileSortPhase:
         bind_group = device.create_bind_group(
             layout=self.pipeline.get_bind_group_layout(0),
             entries=[
-                {"binding": 0, "resource": {"buffer": positions_buffer}},
-                {"binding": 1, "resource": {"buffer": prev_positions_buffer}},
-                {"binding": 2, "resource": {"buffer": tiles_buffer}},
-                {"binding": 3, "resource": {"buffer": self.tile_sort_uniform_buffer}},
+                {"binding": 0, "resource": {"buffer": positions_buffer.buffer}},
+                {"binding": 1, "resource": {"buffer": prev_positions_buffer.buffer}},
+                {"binding": 2, "resource": {"buffer": tiles_buffer.buffer}},
+                {"binding": 3, "resource": {"buffer": self.uniform_buffer.buffer}},
             ],
         )
 
-        self.tile_sort_uniform_values[0][0] = self.tree_bb_min
-        self.tile_sort_uniform_values[0][1] = self.tree_bb_max
-        self.tile_sort_uniform_values[0][2] = separation
-        self.tile_sort_uniform_values[0][3] = number_of_bodies
-        self.tile_sort_uniform_values[0][4] = k
-        self.tile_sort_uniform_values[0][5] = j
+        self.uniform_values[0][0] = self.tree_bb_min
+        self.uniform_values[0][1] = self.tree_bb_max
+        self.uniform_values[0][2] = separation
+        self.uniform_values[0][3] = number_of_bodies
+        self.uniform_values[0][4] = k
+        self.uniform_values[0][5] = j
 
-        self.tile_sort_uniform_buffer_staging.map_sync(wgpu.MapMode.WRITE)
-        self.tile_sort_uniform_buffer_staging.write_mapped(
-            self.tile_sort_uniform_values
-        )
-        self.tile_sort_uniform_buffer_staging.unmap()
-
-        command_encoder.copy_buffer_to_buffer(
-            source=self.tile_sort_uniform_buffer_staging,
-            source_offset=0,
-            destination=self.tile_sort_uniform_buffer,
-            destination_offset=0,
-            size=self.tile_sort_uniform_values.nbytes,
-        )
+        self.uniform_buffer.write_staging(self.uniform_values)
+        self.uniform_buffer.load_staging(command_encoder)
 
         compute_pass = command_encoder.begin_compute_pass()
         compute_pass.set_pipeline(self.pipeline)
@@ -343,24 +325,28 @@ class ComputeQuadTreePhase:
                     var v: u32 = nodes[u].top_left;
                     if v == 0u {
                         v = allocate_node(vec2<f32>(nodes[u].bb_min[0u], vert), vec2<f32>(nodes[u].bb_min[1u], hori));
+                        nodes[u].top_left = v;
                     }
                     current_node = v;
                 } else if p.x >= vert && p.y < hori {
                     var v: u32 = nodes[u].top_right;
                     if v == 0u {
                         v = allocate_node(vec2<f32>(vert, nodes[u].bb_max[0u]), vec2<f32>(nodes[u].bb_min[1u], hori));
+                        nodes[u].top_right = v;
                     }
                     current_node = v;
                 } else if p.x < vert && p.y >= hori {
                     var v: u32 = nodes[u].bottom_left;
                     if v == 0u {
                         v = allocate_node(vec2<f32>(nodes[u].bb_min[0u], vert), vec2<f32>(hori, nodes[u].bb_max[1u]));
+                        nodes[u].bottom_left = v;
                     }
                     current_node = v;
                 } else if p.x >= vert && p.y >= hori {
                     var v: u32 = nodes[u].bottom_right;
                     if v == 0u {
                         v = allocate_node(vec2<f32>(vert, nodes[u].bb_max[0u]), vec2<f32>(hori, nodes[u].bb_max[1u]));
+                        nodes[u].bottom_right = v;
                     }
                     current_node = v;
                 }
@@ -387,38 +373,45 @@ class ComputeQuadTreePhase:
         self.tree_bb_min = tree_bb_min
         self.tree_bb_max = tree_bb_max
 
-        self.uniform_values = np.zeros(shape=(1,), dtype=np.dtype("2f4,2f4,f4,u4,8V"))
+        self.dtype = np.dtype(
+            [
+                ("bb_min", "2f4"),
+                ("bb_max", "2f4"),
+                ("mass_center", "2f4"),
+                ("mass", "f4"),
+                ("start_child", "u4"),
+                ("end_child", "u4"),
+                ("top_left", "u4"),
+                ("top_right", "u4"),
+                ("bottom_left", "u4"),
+                ("bottom_right", "u4"),
+                ("lock", "u4"),
+            ]
+        )
+        self.uniform_values = np.zeros(shape=(1,), dtype=np.dtype("2f4,2f4,f4,u4"))
 
-        self.node_values = np.zeros(
-            shape=(1,), dtype=np.dtype("2f4,2f4,f4,u4,u4,u4,u4,u4,u4,u4")
+        self.nodes_buffer = Buffer(
+            device=device,
+            shape=(self.number_of_bodies * self.max_tree_depth,),
+            dtype=self.dtype,
+            usage=wgpu.BufferUsage.STORAGE,
+            query=True,
         )
 
-        self.nodes_buffer = device.create_buffer(
-            size=self.number_of_bodies
-            * self.node_values.nbytes
-            * self.max_tree_depth
-            * 4,
-            usage=wgpu.BufferUsage.STORAGE + wgpu.BufferUsage.COPY_SRC,
+        self.node_queue_buffer = Buffer(
+            device=device,
+            shape=(1,),
+            dtype=np.dtype("u4,u4"),
+            usage=wgpu.BufferUsage.STORAGE,
+            staging=True,
         )
 
-        self.node_queue_buffer = device.create_buffer(
-            size=32,
-            usage=wgpu.BufferUsage.STORAGE + wgpu.BufferUsage.COPY_DST,
-        )
-
-        self.node_queue_buffer_staging = device.create_buffer(
-            size=32,
-            usage=wgpu.BufferUsage.COPY_SRC + wgpu.BufferUsage.MAP_WRITE,
-        )
-
-        self.uniform_buffer = device.create_buffer(
-            size=self.uniform_values.nbytes,
-            usage=wgpu.BufferUsage.UNIFORM + wgpu.BufferUsage.COPY_DST,
-        )
-
-        self.uniform_buffer_staging = device.create_buffer(
-            size=self.uniform_values.nbytes,
-            usage=wgpu.BufferUsage.COPY_SRC + wgpu.BufferUsage.MAP_WRITE,
+        self.uniform_buffer = Buffer(
+            device=device,
+            shape=(1,),
+            dtype=np.dtype("2f4,2f4,f4,u4"),
+            usage=wgpu.BufferUsage.UNIFORM,
+            staging=True,
         )
 
         pipeline_kwargs = self.get_pipeline_kwargs(device)
@@ -448,10 +441,10 @@ class ComputeQuadTreePhase:
         bind_group = device.create_bind_group(
             layout=self.pipeline.get_bind_group_layout(0),
             entries=[
-                {"binding": 0, "resource": {"buffer": self.nodes_buffer}},
-                {"binding": 1, "resource": {"buffer": self.node_queue_buffer}},
-                {"binding": 2, "resource": {"buffer": positions_buffer}},
-                {"binding": 3, "resource": {"buffer": self.uniform_buffer}},
+                {"binding": 0, "resource": {"buffer": self.nodes_buffer.buffer}},
+                {"binding": 1, "resource": {"buffer": self.node_queue_buffer.buffer}},
+                {"binding": 2, "resource": {"buffer": positions_buffer.buffer}},
+                {"binding": 3, "resource": {"buffer": self.uniform_buffer.buffer}},
             ],
         )
 
@@ -460,36 +453,22 @@ class ComputeQuadTreePhase:
         self.uniform_values[0][2] = separation
         self.uniform_values[0][3] = number_of_bodies
 
-        node_queue_values = np.zeros(shape=(8,), dtype=np.uint32)
-
-        self.uniform_buffer_staging.map_sync(wgpu.MapMode.WRITE)
-        self.node_queue_buffer_staging.map_sync(wgpu.MapMode.WRITE)
-        self.uniform_buffer_staging.write_mapped(self.uniform_values)
-        self.node_queue_buffer_staging.write_mapped(node_queue_values)
-        self.uniform_buffer_staging.unmap()
-        self.node_queue_buffer_staging.unmap()
-
-        command_encoder.copy_buffer_to_buffer(
-            source=self.uniform_buffer_staging,
-            source_offset=0,
-            destination=self.uniform_buffer,
-            destination_offset=0,
-            size=self.uniform_values.nbytes,
+        node_queue_values = np.zeros(
+            shape=self.uniform_buffer.shape, dtype=self.uniform_buffer.dtype
         )
 
-        command_encoder.copy_buffer_to_buffer(
-            source=self.node_queue_buffer_staging,
-            source_offset=0,
-            destination=self.node_queue_buffer,
-            destination_offset=0,
-            size=32,
-        )
+        self.uniform_buffer.write_staging(self.uniform_values)
+        self.node_queue_buffer.write_staging(node_queue_values)
+        self.uniform_buffer.load_staging(command_encoder)
+        self.node_queue_buffer.load_staging(command_encoder)
 
         compute_pass = command_encoder.begin_compute_pass()
         compute_pass.set_pipeline(self.pipeline)
         compute_pass.set_bind_group(0, bind_group)
         compute_pass.dispatch_workgroups(number_of_bodies)
         compute_pass.end()
+
+        self.nodes_buffer.store_query(command_encoder)
 
 
 class RenderingPhase:
@@ -499,16 +478,19 @@ class RenderingPhase:
             @location(1) color : vec4<f32>,
             @builtin(vertex_index) vertex_index : u32,
         };
+
         struct VertexOutput {
             @location(0) color     : vec4<f32>,
             @builtin(position) pos : vec4<f32>,
         };
 
+        @group(0) @binding(0) var<uniform> mvp: mat4x4<f32>;
+
         @vertex
         fn vs_main(in: VertexInput) -> VertexOutput {
             let index = i32(in.vertex_index);
             var out: VertexOutput;
-            out.pos = vec4<f32>(in.pos, 0.0, 1.0);
+            out.pos = mvp * vec4<f32>(in.pos, 0.0, 1.0);
             out.color = in.color;
             return out;
         }
@@ -529,6 +511,31 @@ class RenderingPhase:
     """
 
     def __init__(self, device, context, window_width, window_height):
+        self.mvp_buffer = Buffer(
+            device=device,
+            shape=(1, 4, 4),
+            dtype=np.dtype("f4"),
+            usage=wgpu.BufferUsage.UNIFORM,
+            staging=True,
+        )
+        self.bind_group_layout = device.create_bind_group_layout(
+            entries=[
+                {"binding": 0, "visibility": wgpu.ShaderStage.VERTEX, "buffer": {}}
+            ]
+        )
+        self.bind_group = device.create_bind_group(
+            layout=self.bind_group_layout,
+            entries=[
+                {
+                    "binding": 0,
+                    "resource": {
+                        "buffer": self.mvp_buffer.buffer,
+                        "offset": 0,
+                        "size": self.mvp_buffer.nbytes,
+                    },
+                }
+            ],
+        )
         pipeline_kwargs = self.get_pipeline_kwargs(device, context)
         self.pipeline = device.create_render_pipeline(**pipeline_kwargs)
         self.color_texture = device.create_texture(
@@ -561,6 +568,7 @@ class RenderingPhase:
         number_of_points,
         point_resolution,
     ):
+
         render_pass = command_encoder.begin_render_pass(
             color_attachments=[
                 {
@@ -586,13 +594,16 @@ class RenderingPhase:
         render_pass.set_vertex_buffer(
             slot=1, buffer=vertex_colors_buffer, offset=0, size=None
         )
+        render_pass.set_bind_group(0, self.bind_group)
         render_pass.draw(number_of_points * point_resolution * 3, 1, 0, 0)
         render_pass.end()
 
     def get_pipeline_kwargs(self, device, context):
         render_texture_format = context.get_preferred_format(device.adapter)
         shader = device.create_shader_module(code=self.rendering_shader_source)
-        pipeline_layout = device.create_pipeline_layout(bind_group_layouts=[])
+        pipeline_layout = device.create_pipeline_layout(
+            bind_group_layouts=[self.bind_group_layout]
+        )
 
         return dict(
             layout=pipeline_layout,
@@ -780,9 +791,9 @@ class ApplyAccelerationsPhase:
         bind_group = device.create_bind_group(
             layout=self.pipeline.get_bind_group_layout(0),
             entries=[
-                {"binding": 0, "resource": {"buffer": positions_buffer}},
-                {"binding": 1, "resource": {"buffer": prev_positions_buffer}},
-                {"binding": 2, "resource": {"buffer": acceleratios_buffer}},
+                {"binding": 0, "resource": {"buffer": positions_buffer.buffer}},
+                {"binding": 1, "resource": {"buffer": prev_positions_buffer.buffer}},
+                {"binding": 2, "resource": {"buffer": acceleratios_buffer.buffer}},
             ],
         )
 
@@ -857,8 +868,8 @@ class ComputeAccelerationsPhase:
         bind_group = device.create_bind_group(
             layout=self.pipeline.get_bind_group_layout(0),
             entries=[
-                {"binding": 0, "resource": {"buffer": positions_buffer}},
-                {"binding": 1, "resource": {"buffer": acceleratios_buffer}},
+                {"binding": 0, "resource": {"buffer": positions_buffer.buffer}},
+                {"binding": 1, "resource": {"buffer": acceleratios_buffer.buffer}},
             ],
         )
 
@@ -905,8 +916,8 @@ class ApplyImpulsesPhase:
         bind_group = device.create_bind_group(
             layout=self.pipeline.get_bind_group_layout(0),
             entries=[
-                {"binding": 0, "resource": {"buffer": positions_buffer}},
-                {"binding": 1, "resource": {"buffer": impulses_buffer}},
+                {"binding": 0, "resource": {"buffer": positions_buffer.buffer}},
+                {"binding": 1, "resource": {"buffer": impulses_buffer.buffer}},
             ],
         )
 
@@ -971,8 +982,8 @@ class ComputeImpulsesPhase:
         bind_group = device.create_bind_group(
             layout=self.pipeline.get_bind_group_layout(0),
             entries=[
-                {"binding": 0, "resource": {"buffer": positions_buffer}},
-                {"binding": 1, "resource": {"buffer": impulses_buffer}},
+                {"binding": 0, "resource": {"buffer": positions_buffer.buffer}},
+                {"binding": 1, "resource": {"buffer": impulses_buffer.buffer}},
             ],
         )
 
@@ -1033,8 +1044,8 @@ class SetupVelocitiesPhase:
         bind_group = device.create_bind_group(
             layout=self.pipeline.get_bind_group_layout(0),
             entries=[
-                {"binding": 0, "resource": {"buffer": positions_buffer}},
-                {"binding": 1, "resource": {"buffer": prev_positions_buffer}},
+                {"binding": 0, "resource": {"buffer": positions_buffer.buffer}},
+                {"binding": 1, "resource": {"buffer": prev_positions_buffer.buffer}},
             ],
         )
 
@@ -1104,9 +1115,9 @@ class ComputeColorPhase:
         bind_group = device.create_bind_group(
             layout=self.pipeline.get_bind_group_layout(0),
             entries=[
-                {"binding": 0, "resource": {"buffer": positions_buffer}},
-                {"binding": 1, "resource": {"buffer": prev_positions_buffer}},
-                {"binding": 2, "resource": {"buffer": colors_buffer}},
+                {"binding": 0, "resource": {"buffer": positions_buffer.buffer}},
+                {"binding": 1, "resource": {"buffer": prev_positions_buffer.buffer}},
+                {"binding": 2, "resource": {"buffer": colors_buffer.buffer}},
             ],
         )
 
@@ -1211,8 +1222,8 @@ class TessellationPhase:
         bind_group = device.create_bind_group(
             layout=self.pipeline.get_bind_group_layout(0),
             entries=[
-                {"binding": 0, "resource": {"buffer": positions_buffer}},
-                {"binding": 1, "resource": {"buffer": colors_buffer}},
+                {"binding": 0, "resource": {"buffer": positions_buffer.buffer}},
+                {"binding": 1, "resource": {"buffer": colors_buffer.buffer}},
                 {
                     "binding": 2,
                     "resource": {"buffer": self.vertex_positions_buffer_staging},
@@ -1317,43 +1328,41 @@ class WgpuRenderer:
             self.device, self.context, self.window_width, self.window_height
         )
 
-        self.colors_buffer = self.device.create_buffer(
-            size=self.number_of_points * 4 * 4,
-            usage=wgpu.BufferUsage.COPY_DST + wgpu.BufferUsage.STORAGE,
+        self.colors_buffer = Buffer(
+            device=self.device,
+            shape=(self.number_of_points,),
+            dtype=np.dtype("4f4"),
+            usage=wgpu.BufferUsage.STORAGE,
+            staging=True,
         )
 
-        self.colors_buffer_staging = self.device.create_buffer(
-            size=self.number_of_points * 4 * 4,
-            usage=wgpu.BufferUsage.MAP_WRITE + wgpu.BufferUsage.COPY_SRC,
+        self.positions_buffer = Buffer(
+            device=self.device,
+            shape=(self.number_of_points,),
+            dtype=np.dtype("2f4"),
+            usage=wgpu.BufferUsage.STORAGE,
+            staging=True,
         )
 
-        self.positions_buffer = self.device.create_buffer(
-            size=self.number_of_points * 2 * 4,
-            usage=wgpu.BufferUsage.COPY_DST + wgpu.BufferUsage.STORAGE,
+        self.prev_positions_buffer = Buffer(
+            device=self.device,
+            shape=(self.number_of_points,),
+            dtype=np.dtype("2f4"),
+            usage=wgpu.BufferUsage.STORAGE,
+            staging=True,
         )
 
-        self.positions_buffer_staging = self.device.create_buffer(
-            size=self.number_of_points * 2 * 4,
-            usage=wgpu.BufferUsage.MAP_WRITE + wgpu.BufferUsage.COPY_SRC,
-        )
-
-        self.prev_positions_buffer = self.device.create_buffer(
-            size=self.number_of_points * 2 * 4,
-            usage=wgpu.BufferUsage.COPY_DST + wgpu.BufferUsage.STORAGE,
-        )
-
-        self.prev_positions_buffer_staging = self.device.create_buffer(
-            size=self.number_of_points * 2 * 4,
-            usage=wgpu.BufferUsage.MAP_WRITE + wgpu.BufferUsage.COPY_SRC,
-        )
-
-        self.impulses_buffer = self.device.create_buffer(
-            size=self.number_of_points * 2 * 4,
+        self.impulses_buffer = Buffer(
+            device=self.device,
+            shape=(self.number_of_points,),
+            dtype=np.dtype("2f4"),
             usage=wgpu.BufferUsage.STORAGE,
         )
 
-        self.accelerations_buffer = self.device.create_buffer(
-            size=self.number_of_points * 2 * 4,
+        self.accelerations_buffer = Buffer(
+            device=self.device,
+            shape=(self.number_of_points,),
+            dtype=np.dtype("2f4"),
             usage=wgpu.BufferUsage.STORAGE,
         )
 
@@ -1375,44 +1384,24 @@ class WgpuRenderer:
 
             current_texture = self.context.get_current_texture()
 
+            aspect = current_texture.width / current_texture.height
+            mvp_values = np.eye(4, dtype=np.float32)
+            mvp_values[0, 0] = 1 / aspect
+            self.rendering_phase.mvp_buffer.write_staging(mvp_values)
+
             command_encoder = self.device.create_command_encoder()
+            self.rendering_phase.mvp_buffer.load_staging(command_encoder)
 
             if not self.loaded:
-                self.positions_buffer_staging.map_sync(wgpu.MapMode.WRITE)
-                self.prev_positions_buffer_staging.map_sync(wgpu.MapMode.WRITE)
-                self.colors_buffer_staging.map_sync(wgpu.MapMode.WRITE)
 
-                self.positions_buffer_staging.write_mapped(positions)
-                self.prev_positions_buffer_staging.write_mapped(prev_positions)
-                self.colors_buffer_staging.write_mapped(colors)
+                self.positions_buffer.write_staging(positions)
+                self.prev_positions_buffer.write_staging(prev_positions)
+                self.colors_buffer.write_staging(colors)
 
-                self.positions_buffer_staging.unmap()
-                self.prev_positions_buffer_staging.unmap()
-                self.colors_buffer_staging.unmap()
+                self.positions_buffer.load_staging(command_encoder)
+                self.prev_positions_buffer.load_staging(command_encoder)
+                self.colors_buffer.load_staging(command_encoder)
 
-                command_encoder.copy_buffer_to_buffer(
-                    source=self.positions_buffer_staging,
-                    source_offset=0,
-                    destination=self.positions_buffer,
-                    destination_offset=0,
-                    size=self.number_of_points * 2 * 4,
-                )
-
-                command_encoder.copy_buffer_to_buffer(
-                    source=self.prev_positions_buffer_staging,
-                    source_offset=0,
-                    destination=self.prev_positions_buffer,
-                    destination_offset=0,
-                    size=self.number_of_points * 2 * 4,
-                )
-
-                command_encoder.copy_buffer_to_buffer(
-                    source=self.colors_buffer_staging,
-                    source_offset=0,
-                    destination=self.colors_buffer,
-                    destination_offset=0,
-                    size=self.number_of_points * 4 * 4,
-                )
                 self.compute_point_tile_phase.compute_pass(
                     self.device,
                     self.positions_buffer,
@@ -1438,13 +1427,17 @@ class WgpuRenderer:
                             j //= 2
                         k *= 2
 
-                        self.compute_quad_tree_phase.compute_pass(
-                            self.device,
-                            self.positions_buffer,
-                            command_encoder,
-                            self.number_of_points,
-                            self.simulation.separation,
-                        )
+                    self.compute_point_tile_phase.tiles_buffer.store_query(
+                        command_encoder
+                    )
+
+                    self.compute_quad_tree_phase.compute_pass(
+                        self.device,
+                        self.positions_buffer,
+                        command_encoder,
+                        self.number_of_points,
+                        self.simulation.separation,
+                    )
 
                     self.compute_impulses_phase.compute_pass(
                         self.device,
@@ -1571,15 +1564,22 @@ class WgpuRenderer:
             )
 
             self.device.queue.submit([command_encoder.finish()])
+            node_values = self.compute_quad_tree_phase.nodes_buffer.read_query()
+            node_array = np.frombuffer(
+                node_values, dtype=self.compute_quad_tree_phase.nodes_buffer.dtype
+            )
+            # print(node_array)
+
+            tiles_values = self.compute_point_tile_phase.tiles_buffer.read_query()
+
+            tiles_array = np.frombuffer(tiles_values, dtype=np.uint32)
+            # print(tiles_array)
 
             self.color_output_buffer.map_sync(wgpu.MapMode.READ)
             image_mem = self.color_output_buffer.read_mapped()
             self.color_output_buffer.unmap()
-            image_bytes_padded = np.frombuffer(
-                image_mem.tobytes(), dtype=np.byte
-            ).reshape((self.window_height, width_blocks * 256 // 4, 4))
-            image_array = image_bytes_padded[:, : self.window_width, :]
-            self.simulation.end_frame(image_array)
+
+            self.simulation.end_frame(image_mem)
             self.canvas.request_draw(draw_frame)
 
         return draw_frame
