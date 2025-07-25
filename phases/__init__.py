@@ -9,6 +9,8 @@ from .rendering_phase import RenderingPhase
 from .setup_velocities_phase import SetupVelocitiesPhase
 from .tessellation_phase import TessellationPhase
 from .tile_sort_phase import TileSortPhase
+from .collisions_phase import CollisionsPhase
+from .gravity_phase import GravityPhase
 
 __all__ = [
     "ApplyAccelerationsPhase",
@@ -22,4 +24,6 @@ __all__ = [
     "SetupVelocitiesPhase",
     "TessellationPhase",
     "TileSortPhase",
+    "CollisionsPhase",
+    "GravityPhase",
 ]

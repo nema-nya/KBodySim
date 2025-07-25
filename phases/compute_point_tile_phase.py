@@ -16,10 +16,11 @@ class ComputePointTilePhase:
         @group(0) @binding(2) var<uniform> uniforms: Uniforms;
 
         fn point_to_tile(point: vec2<f32>) -> u32 {
-            let tile_x = u32(point.x / uniforms.separation); 
-            let tile_y = u32(point.y / uniforms.separation);
-            let max_tile_y = u32((uniforms.tree_bb_max.y - uniforms.tree_bb_min.y) / uniforms.separation);
-            return tile_x * max_tile_y + tile_y;
+            let tile_x = i32(point.x / uniforms.separation); 
+            let tile_y = i32(point.y / uniforms.separation);
+            let max_tile_x = i32((uniforms.tree_bb_max.x - uniforms.tree_bb_min.x) / uniforms.separation);
+            let max_tile_y = i32((uniforms.tree_bb_max.y - uniforms.tree_bb_min.y) / uniforms.separation);
+            return u32((tile_x + max_tile_x) * max_tile_y * 2 + tile_y + max_tile_y);
         }
 
         @compute @workgroup_size(1, 1, 1) fn main(@builtin(global_invocation_id) id: vec3<u32>) {

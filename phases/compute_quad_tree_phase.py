@@ -117,28 +117,28 @@ class ComputeQuadTreePhase:
                 if p.x < vert && p.y < hori {
                     var v: u32 = nodes[u].top_left;
                     if v == 0u {
-                        v = allocate_node(vec2<f32>(nodes[u].bb_min[0u], vert), vec2<f32>(nodes[u].bb_min[1u], hori));
+                        v = allocate_node(nodes[u].bb_min, vec2<f32>(vert, hori));
                         nodes[u].top_left = v;
                     }
                     current_node = v;
                 } else if p.x >= vert && p.y < hori {
                     var v: u32 = nodes[u].top_right;
                     if v == 0u {
-                        v = allocate_node(vec2<f32>(vert, nodes[u].bb_max[0u]), vec2<f32>(nodes[u].bb_min[1u], hori));
+                        v = allocate_node(vec2<f32>(vert, nodes[u].bb_min[1u]), vec2<f32>(nodes[u].bb_max[0u], hori));
                         nodes[u].top_right = v;
                     }
                     current_node = v;
                 } else if p.x < vert && p.y >= hori {
                     var v: u32 = nodes[u].bottom_left;
                     if v == 0u {
-                        v = allocate_node(vec2<f32>(nodes[u].bb_min[0u], vert), vec2<f32>(hori, nodes[u].bb_max[1u]));
+                        v = allocate_node(vec2<f32>(nodes[u].bb_min[0u], hori), vec2<f32>(vert, nodes[u].bb_max[1u]));
                         nodes[u].bottom_left = v;
                     }
                     current_node = v;
                 } else if p.x >= vert && p.y >= hori {
                     var v: u32 = nodes[u].bottom_right;
                     if v == 0u {
-                        v = allocate_node(vec2<f32>(vert, nodes[u].bb_max[0u]), vec2<f32>(hori, nodes[u].bb_max[1u]));
+                        v = allocate_node(vec2<f32>(vert, hori), vec2<f32>(nodes[u].bb_max[0u], nodes[u].bb_max[1u]));
                         nodes[u].bottom_right = v;
                     }
                     current_node = v;
@@ -185,7 +185,7 @@ class ComputeQuadTreePhase:
 
         self.nodes_buffer = Buffer(
             device=device,
-            shape=(self.number_of_bodies * self.max_tree_depth,),
+            shape=(self.number_of_bodies * self.max_tree_depth * 4,),
             dtype=self.dtype,
             usage=wgpu.BufferUsage.STORAGE,
             query=True,

@@ -36,56 +36,13 @@ class WgpuRenderer:
         self.context = self.canvas.get_context("wgpu")
         self.context.configure(device=self.device, format=None)
 
-        self.compute_point_tile_phase = ComputePointTilePhase(
-            self.device,
-            self.number_of_points,
-            self.simulation.tree_bb_min,
-            self.simulation.tree_bb_max,
+        self.collisions_phase = CollisionsPhase(
+            self.device, self.number_of_points, self.simulation
         )
 
-        self.tile_sort_phase = {}
-
-        k = 2
-        while k <= self.number_of_points:
-            j = k // 2
-            while j > 0:
-                self.tile_sort_phase[(k, j)] = TileSortPhase(
-                    self.device,
-                    self.simulation.tree_bb_min,
-                    self.simulation.tree_bb_max,
-                )
-                j = j // 2
-            k = k * 2
-
-        self.compute_quad_tree_phase = ComputeQuadTreePhase(
-            self.device,
-            self.number_of_points,
-            self.simulation.max_tree_depth,
-            self.simulation.tree_bb_min,
-            self.simulation.tree_bb_max,
+        self.gravity_phase = GravityPhase(
+            self.device, self.number_of_points, self.simulation
         )
-
-        self.compute_accelerations_phase = ComputeAccelerationsPhase(
-            self.number_of_points,
-            self.device,
-            self.simulation.separation,
-            self.simulation.gravitational_constant,
-            self.simulation.dt,
-        )
-
-        self.apply_accelerations_phase = ApplyAccelerationsPhase(
-            self.device,
-            self.simulation.gravitational_constant,
-            self.simulation.dt,
-        )
-
-        self.compute_impulses_phase = ComputeImpulsesPhase(
-            self.number_of_points,
-            self.device,
-            self.simulation.separation,
-        )
-
-        self.apply_impulses_phase = ApplyImpulsesPhase(self.device)
 
         self.setup_velocities_phase = SetupVelocitiesPhase(
             self.device, self.simulation.initial_spin, self.simulation.dt
@@ -125,20 +82,6 @@ class WgpuRenderer:
             staging=True,
         )
 
-        self.impulses_buffer = Buffer(
-            device=self.device,
-            shape=(self.number_of_points,),
-            dtype=np.dtype("2f4"),
-            usage=wgpu.BufferUsage.STORAGE,
-        )
-
-        self.accelerations_buffer = Buffer(
-            device=self.device,
-            shape=(self.number_of_points,),
-            dtype=np.dtype("2f4"),
-            usage=wgpu.BufferUsage.STORAGE,
-        )
-
         width_blocks = (self.window_width * 4 + 255) // 256
         self.color_output_buffer = self.device.create_buffer(
             size=width_blocks * 256 * self.window_height,
@@ -149,11 +92,9 @@ class WgpuRenderer:
 
     def get_draw_function(self):
         def draw_frame():
-            positions_colors = self.simulation.start_frame()
-            if positions_colors is None:
+            if not self.simulation.start_frame():
                 self.canvas.close()
                 return
-            positions, prev_positions, colors = positions_colors
 
             current_texture = self.context.get_current_texture()
 
@@ -166,66 +107,26 @@ class WgpuRenderer:
             self.rendering_phase.mvp_buffer.load_staging(command_encoder)
 
             if not self.loaded:
-
-                self.positions_buffer.write_staging(positions)
-                self.prev_positions_buffer.write_staging(prev_positions)
-                self.colors_buffer.write_staging(colors)
+                positions_values = (
+                    np.random.randn(self.number_of_points, 2).astype(np.float32)
+                    * self.simulation.spawn_radius
+                )
+                colors_values = np.ones(shape=(self.number_of_points, 4)).astype(
+                    np.float32
+                )
+                self.positions_buffer.write_staging(positions_values)
+                self.prev_positions_buffer.write_staging(positions_values)
+                self.colors_buffer.write_staging(colors_values)
 
                 self.positions_buffer.load_staging(command_encoder)
                 self.prev_positions_buffer.load_staging(command_encoder)
                 self.colors_buffer.load_staging(command_encoder)
 
-                self.compute_point_tile_phase.compute_pass(
-                    self.device,
-                    self.positions_buffer,
-                    command_encoder,
-                    self.simulation.separation,
-                )
                 for _ in range(self.simulation.init_substeps):
-                    k = 2
-                    while k <= self.number_of_points:
-                        j = k // 2
-                        while j > 0:
-                            self.tile_sort_phase[(k, j)].compute_pass(
-                                self.device,
-                                self.positions_buffer,
-                                self.prev_positions_buffer,
-                                self.compute_point_tile_phase.tiles_buffer,
-                                command_encoder,
-                                self.number_of_points,
-                                self.simulation.separation,
-                                k,
-                                j,
-                            )
-                            j = j // 2
-                        k = k * 2
-
-                    self.compute_point_tile_phase.tiles_buffer.store_query(
-                        command_encoder
-                    )
-
-                    self.compute_quad_tree_phase.compute_pass(
-                        self.device,
-                        self.positions_buffer,
+                    self.collisions_phase.compute_pass(
                         command_encoder,
-                        self.number_of_points,
-                        self.simulation.separation,
-                    )
-
-                    self.compute_impulses_phase.compute_pass(
-                        self.device,
                         self.positions_buffer,
-                        self.impulses_buffer,
-                        command_encoder,
-                        self.number_of_points,
-                    )
-
-                    self.apply_impulses_phase.compute_pass(
-                        self.device,
-                        self.positions_buffer,
-                        self.impulses_buffer,
-                        command_encoder,
-                        self.number_of_points,
+                        self.prev_positions_buffer,
                     )
 
                 self.setup_velocities_phase.compute_pass(
@@ -237,40 +138,18 @@ class WgpuRenderer:
                 )
 
                 self.loaded = True
-
-            for _ in range(self.simulation.substeps):
-                self.compute_accelerations_phase.compute_pass(
-                    self.device,
-                    self.positions_buffer,
-                    self.accelerations_buffer,
-                    command_encoder,
-                    self.number_of_points,
-                )
-
-                self.apply_accelerations_phase.compute_pass(
-                    self.device,
-                    self.positions_buffer,
-                    self.prev_positions_buffer,
-                    self.accelerations_buffer,
-                    command_encoder,
-                    self.number_of_points,
-                )
-
-                self.compute_impulses_phase.compute_pass(
-                    self.device,
-                    self.positions_buffer,
-                    self.impulses_buffer,
-                    command_encoder,
-                    self.number_of_points,
-                )
-
-                self.apply_impulses_phase.compute_pass(
-                    self.device,
-                    self.positions_buffer,
-                    self.impulses_buffer,
-                    command_encoder,
-                    self.number_of_points,
-                )
+            else:
+                for _ in range(self.simulation.substeps):
+                    self.gravity_phase.compute_pass(
+                        command_encoder,
+                        self.positions_buffer,
+                        self.prev_positions_buffer,
+                    )
+                    self.collisions_phase.compute_pass(
+                        command_encoder,
+                        self.positions_buffer,
+                        self.prev_positions_buffer,
+                    )
 
             self.compute_colors_phase.compute_pass(
                 self.device,
@@ -311,16 +190,6 @@ class WgpuRenderer:
             )
 
             self.device.queue.submit([command_encoder.finish()])
-            # node_values = self.compute_quad_tree_phase.nodes_buffer.read_query()
-            # node_array = np.frombuffer(
-            #     node_values, dtype=self.compute_quad_tree_phase.nodes_buffer.dtype
-            # )
-            # print(node_array)
-
-            # tiles_values = self.compute_point_tile_phase.tiles_buffer.read_query()
-
-            # tiles_array = np.frombuffer(tiles_values, dtype=np.uint32)
-            # print(tiles_array)
 
             self.color_output_buffer.map_sync(wgpu.MapMode.READ)
             image_mem = self.color_output_buffer.read_mapped()
