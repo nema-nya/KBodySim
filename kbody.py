@@ -1,24 +1,25 @@
 import numpy as np
 from ffmpeg_writer import FfmpegWriter
 from wgpu_renderer import WgpuRenderer
+import os
 
 
 class Simulation:
 
     def __init__(self):
-        self.number_of_points = 8
+        self.number_of_points = 2
         self.point_resolution = 256
         self.window_width = 1280
         self.window_height = 720
-        self.separation = 0.01
+        self.separation = 0.05
         self.point_radius = self.separation
-        self.gravitational_constant = 0.001
+        self.gravitational_constant = 0.1
         self.substeps = 8
         self.dt = 1e-4
-        self.frame_count = 600
+        self.frame_count = 60 * 30
         self.pole_distance = self.separation * 5
-        self.spawn_radius = 0.1
-        self.initial_spin = 0.2
+        self.spawn_radius = 0.2
+        self.initial_spin = 5.5
         self.init_substeps = 32
         self.max_tree_depth = 4
         self.tree_bb_min = (
@@ -29,7 +30,7 @@ class Simulation:
         )
 
         self.ffmpeg_writer = FfmpegWriter(
-            "out.webm", self.window_width, self.window_height
+            os.path.join("outputs", "out.webm"), self.window_width, self.window_height
         )
 
         angles = np.random.rand(self.number_of_points) * 2 * np.pi
