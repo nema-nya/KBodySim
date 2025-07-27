@@ -47,7 +47,7 @@ class ComputeAccelerationsPhase:
                 let d = length(dir);
 
                 if d / s > 1 / theta {
-                    accel += dir / d / d*d * nodes[u].mass;
+                    accel += dir / d / (d*d) * nodes[u].mass;
                     continue;
                 } 
 
@@ -78,7 +78,7 @@ class ComputeAccelerationsPhase:
                     if d <= 2.0 * separation {
                         continue;
                     }
-                    accel += dir / d / d*d * 1.0;
+                    accel += dir / d / (d*d) * 1.0;
                 }
 
             }

@@ -7,18 +7,18 @@ import os
 class Simulation:
 
     def __init__(self):
-        self.number_of_points = 1000
+        self.number_of_points = 100
         self.point_resolution = 32
         self.window_width = 1280
         self.window_height = 720
         self.separation = 0.01
         self.point_radius = self.separation
-        self.gravitational_constant = 0.1
+        self.gravitational_constant = 0.5
         self.substeps = 8
         self.dt = 1e-4
         self.frame_count = 60 * 30
-        self.spawn_radius = 0.3
-        self.initial_spin = 10
+        self.spawn_radius = 0.5
+        self.initial_spin = 7.5
         self.init_substeps = 32
         self.max_tree_depth = 9
         self.theta = 0.5
